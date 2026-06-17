@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,8 +107,9 @@ func NewHyperliquidAdapter(cfg *config.ExchangeConfig, bus *core.EventBus) (*Hyp
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// 解析 Agent 私钥为 *ecdsa.PrivateKey
-	privateKey, err := crypto.HexToECDSA(hlCfg.PrivateKey)
+	// 解析 Agent 私钥为 *ecdsa.PrivateKey（兼容 0x 前缀）
+	pkHex := strings.TrimPrefix(hlCfg.PrivateKey, "0x")
+	privateKey, err := crypto.HexToECDSA(pkHex)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("解析 Agent 私钥失败: %w", err)
