@@ -8,19 +8,19 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # ★★★ 必填：在 Dockge 中填入真实值 ★★★
-      - MARTIN_EXCHANGE_API_KEY=  # Agent 钱包私钥（64 位十六进制，不含 0x）
-      - MARTIN_EXCHANGE_API_SECRET=  # 主钱包地址（42 字符十六进制，含 0x）
+      # ★★★ 必填：填入真实的 Hyperliquid 密钥 ★★★
+      MARTIN_EXCHANGE_API_KEY: ""
+      MARTIN_EXCHANGE_API_SECRET: ""
 
-      # 可选配置（以下为默认值，可按需修改）
-      - MARTIN_EXCHANGE_SYMBOL=HYPE
-      - MARTIN_EXCHANGE_USE_TESTNET=false
-      - MARTIN_STRATEGY_MAX_SAFETY_ORDERS=9
-      - MARTIN_STRATEGY_ATR_PERIOD=14
-      - MARTIN_STRATEGY_BASE_RATIO=0.05
-      - MARTIN_STORAGE_SQLITE_PATH=/app/data/bot.db
-      - MARTIN_LOG_LEVEL=info
-      - MARTIN_HEALTH_ADDR=:8080
+      # 可选配置（以下为默认值）
+      MARTIN_EXCHANGE_SYMBOL: "HYPE"
+      MARTIN_EXCHANGE_USE_TESTNET: "false"
+      MARTIN_STRATEGY_MAX_SAFETY_ORDERS: "9"
+      MARTIN_STRATEGY_ATR_PERIOD: "14"
+      MARTIN_STRATEGY_BASE_RATIO: "0.05"
+      MARTIN_STORAGE_SQLITE_PATH: "/app/data/bot.db"
+      MARTIN_LOG_LEVEL: "info"
+      MARTIN_HEALTH_ADDR: ":8080"
     volumes:
       - bot-data:/app/data
 
