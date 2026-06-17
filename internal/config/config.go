@@ -10,6 +10,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -88,7 +89,7 @@ func LoadConfig(path string) (*Config, error) {
 
 	// config.yaml 可选：不存在时不报错，纯靠环境变量 + 默认值
 	if err := viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+		if !os.IsNotExist(err) {
 			// 文件存在但格式错误，仍然报错
 			return nil, fmt.Errorf("读取配置文件失败: %w", err)
 		}
