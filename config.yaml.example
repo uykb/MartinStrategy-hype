@@ -1,38 +1,30 @@
-# Hyperliquid 交易所配置
+# Hyperliquid 马丁格尔策略机器人 — YAML 配置文件
 # ⚠️ 复制此文件为 config.yaml 并填入真实密钥
-# ⚠️ 生产环境务必通过环境变量设置密钥，不要明文写入配置文件
+# ⚠️ config.yaml 已加入 .gitignore，不会被提交到仓库
+#
+# Docker 部署方式：
+#   将 config.yaml 放在 docker-compose.yml 同目录下，容器会自动通过 volume 挂载读取
+#   不需要设置 MARTIN_EXCHANGE_API_KEY 环境变量
 
 exchange:
-  api_key: ""           # Agent 钱包私钥（十六进制，不含 0x 前缀）
-                        # 通过环境变量 MARTIN_EXCHANGE_API_KEY 设置
-  api_secret: ""        # 主钱包地址（十六进制，含 0x 前缀）
-                        # 通过环境变量 MARTIN_EXCHANGE_API_SECRET 设置
-  symbol: "HYPE"        # 交易对名称（注意：不带 USDT 后缀）
-  use_testnet: false    # 是否使用测试网
+  api_key: ""            # ★ 必填：Agent 钱包私钥（64 位十六进制，不含 0x 前缀）
+  api_secret: ""         # ★ 必填：主钱包地址（42 位十六进制，含 0x 前缀）
+  symbol: "HYPE"         # 交易对
+  use_testnet: false     # 是否使用测试网
 
-# 策略配置
 strategy:
-  # 最大网格层数（9 级：1h/2h/4h/8h/12h/1d/3d/1w/1M）
-  # 数量递增：首仓=1x, 加仓1=0.5x, 加仓2=0.5x, 加仓3=1x, 加仓4=1x, 之后斐波那契递增
-  max_safety_orders: 9
-  # ATR 计算周期
-  atr_period: 14
-  # 头仓金额 = 账户 USDC 余额 × base_ratio（不低于 10 USDC）
-  base_ratio: 0.05
+  max_safety_orders: 9   # 网格层数（9级：1h/2h/4h/8h/12h/1d/3d/1w/1M）
+  atr_period: 14         # ATR 计算周期
+  base_ratio: 0.05       # 头仓金额 = 余额 × base_ratio
 
-# 存储配置
 storage:
-  sqlite_path: "bot.db"
-  redis_addr: "localhost:6379"
+  sqlite_path: "/app/data/bot.db"  # Docker 中持久化到 /app/data
+  redis_addr: ""          # 留空 = 不启用 Redis（单实例部署无需 Redis）
   redis_pass: ""
   redis_db: 0
 
-# 日志配置
 log:
   level: "info"
 
-# 健康检查配置
-# /healthz → liveness 探针（进程存活=200）
-# /readyz  → readiness 探针（WS 活跃 + FSM 未冻结=200）
 health:
   addr: ":8080"
