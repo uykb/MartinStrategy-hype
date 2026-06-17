@@ -107,15 +107,22 @@ func NewHyperliquidAdapter(cfg *config.ExchangeConfig, bus *core.EventBus) (*Hyp
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// 诊断日志：打印密钥长度（不打印内容，保证安全）
+	utils.Logger.Info("Hyperliquid 适配器初始化",
+		zap.String("symbol", hlCfg.Symbol),
+		zap.Bool("testnet", hlCfg.UseTestnet),
+		zap.Int("api_key_length", len(hlCfg.PrivateKey)),
+		zap.Int("api_secret_length", len(hlCfg.AccountAddress)))
+
 	// 解析 Agent 私钥为 *ecdsa.PrivateKey（兼容 0x 前缀）
 	pkHex := strings.TrimPrefix(hlCfg.PrivateKey, "0x")
 	if pkHex == "" {
 		cancel()
-		return nil, fmt.Errorf("Agent 私钥为空，请设置 MARTIN_EXCHANGE_API_KEY 环境变量（64 位十六进制字符串，不含 0x 前缀）")
+		return nil, fmt.Errorf("Agent 私钥为空（环境变量 MARTIN_EXCHANGE_API_KEY 未设置或为空），需要 64 位十六进制字符串，不含 0x 前缀")
 	}
 	if len(pkHex) != 64 {
 		cancel()
-		return nil, fmt.Errorf("Agent 私钥长度无效: 需要 64 个十六进制字符（256 bits），实际 %d 个字符。请检查 MARTIN_EXCHANGE_API_KEY 环境变量", len(pkHex))
+		return nil, fmt.Errorf("Agent 私钥长度无效: 需要 64 个十六进制字符（256 bits），实际 %d 个字符（含0x前缀=%d）。请检查 MARTIN_EXCHANGE_API_KEY 环境变量", len(pkHex), len(hlCfg.PrivateKey))
 	}
 	privateKey, err := crypto.HexToECDSA(pkHex)
 	if err != nil {
