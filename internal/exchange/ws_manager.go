@@ -845,13 +845,19 @@ func (w *WSManager) handleOrderUpdates(data json.RawMessage) {
 		}
 	}()
 
-	var orderData wsOrderUpdateData
-	if err := json.Unmarshal(data, &orderData); err != nil {
-		utils.Logger.Error("解析 orderUpdates 数据失败", zap.Error(err))
-		return
+	// orderUpdates 数据格式为直接数组 [{...}]，不是 {"orders":[...]}。
+	// 先尝试数组解析，失败再尝试包装对象解析（兼容两种格式）。
+	var orders []wsOrderUpdate
+	if err := json.Unmarshal(data, &orders); err != nil {
+		var orderData wsOrderUpdateData
+		if err := json.Unmarshal(data, &orderData); err != nil {
+			utils.Logger.Error("解析 orderUpdates 数据失败", zap.Error(err))
+			return
+		}
+		orders = orderData.Orders
 	}
 
-	for _, ou := range orderData.Orders {
+	for _, ou := range orders {
 		// 过滤非目标交易对
 		if ou.Order.Coin != w.cfg.Symbol {
 			continue
