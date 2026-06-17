@@ -109,10 +109,18 @@ func NewHyperliquidAdapter(cfg *config.ExchangeConfig, bus *core.EventBus) (*Hyp
 
 	// 解析 Agent 私钥为 *ecdsa.PrivateKey（兼容 0x 前缀）
 	pkHex := strings.TrimPrefix(hlCfg.PrivateKey, "0x")
+	if pkHex == "" {
+		cancel()
+		return nil, fmt.Errorf("Agent 私钥为空，请设置 MARTIN_EXCHANGE_API_KEY 环境变量（64 位十六进制字符串，不含 0x 前缀）")
+	}
+	if len(pkHex) != 64 {
+		cancel()
+		return nil, fmt.Errorf("Agent 私钥长度无效: 需要 64 个十六进制字符（256 bits），实际 %d 个字符。请检查 MARTIN_EXCHANGE_API_KEY 环境变量", len(pkHex))
+	}
 	privateKey, err := crypto.HexToECDSA(pkHex)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("解析 Agent 私钥失败: %w", err)
+		return nil, fmt.Errorf("解析 Agent 私钥失败: %w（请确认 MARTIN_EXCHANGE_API_KEY 为有效的 64 位十六进制私钥）", err)
 	}
 
 	// 初始化交易客户端（使用 Agent 私钥进行 L1 签名）
