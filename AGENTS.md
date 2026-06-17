@@ -4,7 +4,7 @@
 
 ```bash
 # Build binary
-go build -o bot cmd/bot/main.go
+go build -o bot ./cmd/bot/
 
 # Run all tests
 go test ./...
@@ -124,8 +124,8 @@ if err := doNetworkCall(); err != nil {
 ## Key Constants
 - `MinOrderValue = 10.0` - Minimum USDC order value for Hyperliquid Perps (动态头仓下限)
 - Event queue buffer: 1000
-- Grid levels: 8 max (30m/1h/2h/4h/8h/12h/1d/1w, Fibonacci scaled)
-- Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13, 21 (starting from 1,1)
+- Grid levels: 9 max (1h/2h/4h/8h/12h/1d/3d/1w/1M)
+- Quantity scaling: 首仓=1x, 加仓1=0.5x, 加仓2=0.5x, 加仓3=1x, 加仓4=1x, then Fibonacci (2,3,5,8...)
 - Price polling interval: 10s
 - Position monitor interval: 5s
 - Grid order API rate limit: 200ms between orders
@@ -134,43 +134,52 @@ if err := doNetworkCall(); err != nil {
 - REST resync on reconnect: query position + open orders + recent fills
 
 ## Key Config Parameters
-- `base_ratio: 0.1` - 头仓金额 = 账户 USDC 余额 × base_ratio（动态计算，每次开仓前实时查询）
-- `max_safety_orders: 8` - 最大网格层数
+- `base_ratio: 0.05` - 头仓金额 = 账户 USDC 余额 × base_ratio（动态计算，每次开仓前实时查询）
+- `max_safety_orders: 9` - 最大网格层数
 - `atr_period: 14` - ATR 计算周期
 
 ## Grid Strategy Details
 
-### ATR Grid Distances (8 Levels)
+### ATR Grid Distances (9 Levels)
 
 | Level | Timeframe | ATR Source | Description |
 |-------|-----------|------------|-------------|
-| 1 | 30m | `fetchATR("30m")` | 首层保护 |
-| 2 | 1h | `fetchATR("1h")` | 第二层保护 |
-| 3 | 2h | `fetchATR("2h")` | 中短期保护 |
-| 4 | 4h | `fetchATR("4h")` | 中期保护 |
-| 5 | 8h | `fetchATR("8h")` | 中长期保护 |
-| 6 | 12h | `fetchATR("12h")` | 长期保护 |
-| 7 | 1d | `fetchATR("1d")` | 长期保护 |
-| 8 | 1w | `fetchATR("1w")` | 最深层保护 |
+| 1 | 1h | `fetchATR("1h")` | 首层保护 |
+| 2 | 2h | `fetchATR("2h")` | 第二层保护 |
+| 3 | 4h | `fetchATR("4h")` | 中短期保护 |
+| 4 | 8h | `fetchATR("8h")` | 中期保护 |
+| 5 | 12h | `fetchATR("12h")` | 中长期保护 |
+| 6 | 1d | `fetchATR("1d")` | 长期保护 |
+| 7 | 3d | `fetchATR("3d")` | 长期保护 |
+| 8 | 1w | `fetchATR("1w")` | 超长期保护 |
+| 9 | 1M | `fetchATR("1M")` | 最深层保护 |
 
 - Distances are **relative to previous order**, not absolute
 - ATR fetch failure fallback: `entryPrice * 0.01`
-- Beyond level 8, fallback to last defined distance (ATR(1w))
+- Beyond level 9, fallback to last defined distance (ATR(1M))
 
-### Fibonacci Quantity Scaling
+### Quantity Scaling (getGridMultiplier)
+
+首仓 = base_ratio，前两次加仓使用半仓，从第三次起斐波那契递增：
 
 ```go
-func getFibonacci(n int) int {
-    if n <= 0 { return 0 }
-    a, b := 1, 1
-    for i := 1; i < n; i++ {
-        a, b = b, a+b
+func (s *MartingaleStrategy) getGridMultiplier(level int) float64 {
+    switch level {
+    case 1: return 1.0   // 首仓
+    case 2: return 0.5   // 第一次加仓（半仓）
+    case 3: return 0.5   // 第二次加仓（半仓）
+    case 4: return 1.0   // 第三次加仓
+    case 5: return 1.0   // 第四次加仓
+    default:
+        // 斐波那契递增：level 6→2.0, 7→3.0, 8→5.0, 9→8.0
+        a, b := 1.0, 1.0
+        for i := 6; i <= level; i++ { a, b = b, a+b }
+        return b
     }
-    return a
 }
 ```
 
-Generates: 1, 1, 2, 3, 5, 8, 13, 21 for levels 1-8.
+Generates: 1.0, 0.5, 0.5, 1.0, 1.0, 2.0, 3.0, 5.0, 8.0 for levels 1-9.
 
 ### Take Profit (TP)
 
@@ -198,7 +207,7 @@ func (s *MartingaleStrategy) calcMinNotional() float64 {
 
 - 调用时机：`enterLong()` 和 `placeGridOrders()` 各调用一次，同一轮下单内缓存结果
 - `enterLong` 中计算 `unitQty = calcMinNotional() / currentPrice`
-- `placeGridOrders` 中计算 `unitQty = calcMinNotional() / entryPrice`，循环内复用该值
+- `placeGridOrders` 中计算 `unitQty = calcMinNotional() / entryPrice`，循环内按 `getGridMultiplier(i)` 缩放
 
 ## Adding Features
 

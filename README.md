@@ -280,12 +280,13 @@ exchange:
 
 # 策略配置
 strategy:
-  # 最大网格层数（Fibonacci 序列：1,1,2,3,5,8,13,21）
-  max_safety_orders: 8
+  # 最大网格层数（9 级：1h/2h/4h/8h/12h/1d/3d/1w/1M）
+  # 数量递增：首仓=1x, 加仓1=0.5x, 加仓2=0.5x, 加仓3=1x, 加仓4=1x, 之后斐波那契递增
+  max_safety_orders: 9
   # ATR 计算周期
   atr_period: 14
   # 头仓金额 = 账户 USDC 余额 × base_ratio（不低于 10 USDC）
-  base_ratio: 0.1
+  base_ratio: 0.05
 
 # 存储配置
 storage:
@@ -314,8 +315,8 @@ export MARTIN_EXCHANGE_API_KEY="your_agent_private_key_hex"
 export MARTIN_EXCHANGE_API_SECRET="0xyour_main_wallet_address"
 export MARTIN_EXCHANGE_SYMBOL="HYPE"
 export MARTIN_EXCHANGE_USE_TESTNET="true"
-export MARTIN_STRATEGY_MAX_SAFETY_ORDERS="8"
-export MARTIN_STRATEGY_BASE_RATIO="0.1"
+export MARTIN_STRATEGY_MAX_SAFETY_ORDERS="9"
+export MARTIN_STRATEGY_BASE_RATIO="0.05"
 export MARTIN_LOG_LEVEL="debug"
 export MARTIN_HEALTH_ADDR=":9090"
 ```
@@ -400,35 +401,40 @@ readinessProbe:
 
 | 层级 | 间距计算 | 时间框架 | 说明 |
 |------|----------|----------|------|
-| 1 | ATR(30m) | 30 分钟 | 首层保护 |
-| 2 | ATR(1h) | 1 小时 | 第二层保护 |
-| 3 | ATR(2h) | 2 小时 | 中短期保护 |
-| 4 | ATR(4h) | 4 小时 | 中期保护 |
-| 5 | ATR(8h) | 8 小时 | 中长期保护 |
-| 6 | ATR(12h) | 12 小时 | 长期保护 |
-| 7 | ATR(1d) | 日线 | 长期保护 |
-| 8 | ATR(1w) | 周线 | 最深层保护 |
+| 1 | ATR(1h) | 1 小时 | 首层保护 |
+| 2 | ATR(2h) | 2 小时 | 第二层保护 |
+| 3 | ATR(4h) | 4 小时 | 中短期保护 |
+| 4 | ATR(8h) | 8 小时 | 中期保护 |
+| 5 | ATR(12h) | 12 小时 | 中长期保护 |
+| 6 | ATR(1d) | 日线 | 长期保护 |
+| 7 | ATR(3d) | 3 日 | 长期保护 |
+| 8 | ATR(1w) | 周线 | 超长期保护 |
+| 9 | ATR(1M) | 月线 | 最深层保护 |
 
 > 间距为**相对上一层**的距离。ATR 获取失败时回退至入场价 × 1%。
 
-### Fibonacci 加仓数量
+### 数量递增规则
 
-| 层级 | Fibonacci 倍数 | 数量（unit=1） | 累计倍数 |
-|------|----------------|----------------|----------|
-| 1 | 1 | 1 | 1 |
-| 2 | 1 | 1 | 2 |
-| 3 | 2 | 2 | 4 |
-| 4 | 3 | 3 | 7 |
-| 5 | 5 | 5 | 12 |
-| 6 | 8 | 8 | 20 |
-| 7 | 13 | 13 | 33 |
-| 8 | 21 | 21 | 54 |
+首仓 = `base_ratio`，前两次加仓使用半仓，从第三次起斐波那契递增：
+
+| 层级 | 倍数 | 说明 | 数量（假设 unitQty=1） |
+|------|------|------|------------------------|
+| 1 | 1.0 | 首仓 | 1 |
+| 2 | 0.5 | 第一次加仓（半仓） | 0.5 |
+| 3 | 0.5 | 第二次加仓（半仓） | 0.5 |
+| 4 | 1.0 | 第三次加仓 | 1 |
+| 5 | 1.0 | 第四次加仓 | 1 |
+| 6 | 2.0 | 第五次加仓（1+1） | 2 |
+| 7 | 3.0 | 第六次加仓（1+2） | 3 |
+| 8 | 5.0 | 第七次加仓（2+3） | 5 |
+| 9 | 8.0 | 第八次加仓（3+5） | 8 |
+
+> `base_ratio` 默认 0.05，头仓金额 = 账户 USDC 余额 × 0.05
 
 ### 止盈策略
 
 - **计算基准**：当前持仓均价（EntryPrice）
 - **止盈价格**：`avgPrice + ATR(30m)`
-- **止盈数量**：全仓平出
 - **更新时机**：每次安全单成交后重新计算并替换 TP 订单
 
 ## 目录结构
@@ -500,8 +506,8 @@ readinessProbe:
 
 | 特性 | 说明 |
 |------|------|
-| 动态头仓 | `余额 × base_ratio`，不低于 10 USDC |
-| 网格层级 | 最多 8 层 Fibonacci 序列 |
+| 动态头仓 | `余额 × base_ratio(0.05)`，不低于 10 USDC |
+| 网格层级 | 9 层（1h/2h/4h/8h/12h/1d/3d/1w/1M） |
 | 仓位监控 | 每 5s 检查，检测手动平仓自动重置 |
 | 对账冻结 | `frozen atomic.Bool`，对账期间丢弃 tick 和 orderUpdate |
 | 过期行情 | `PriceUpdate.IsStale(2s)` 丢弃超过 2 秒的陈旧价格 |
