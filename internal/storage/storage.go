@@ -2,11 +2,16 @@ package storage
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
+
+	"github.com/uykb/MartinStrategy/internal/utils"
 )
 
 type Database struct {
@@ -38,6 +43,14 @@ type BotState struct {
 }
 
 func InitStorage(sqlitePath, redisAddr, redisPass string, redisDB int) (*Database, error) {
+	// 确保 SQLite 数据库文件的父目录存在
+	dir := filepath.Dir(sqlitePath)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, err
+		}
+	}
+
 	// Initialize SQLite
 	db, err := gorm.Open(sqlite.Open(sqlitePath), &gorm.Config{})
 	if err != nil {
@@ -49,12 +62,24 @@ func InitStorage(sqlitePath, redisAddr, redisPass string, redisDB int) (*Databas
 		return nil, err
 	}
 
-	// Initialize Redis
+	// Initialize Redis（可选：连接失败不阻断启动）
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisAddr,
 		Password: redisPass,
 		DB:       redisDB,
 	})
+
+	// 测试 Redis 连接，失败时仅警告，不阻断启动
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := rdb.Ping(ctx).Result(); err != nil {
+		utils.Logger.Warn("Redis 连接失败，分布式锁功能不可用（单实例部署可忽略）",
+			zap.String("addr", redisAddr),
+			zap.Error(err))
+		rdb = nil // 标记为不可用
+	} else {
+		utils.Logger.Info("Redis 连接成功", zap.String("addr", redisAddr))
+	}
 
 	return &Database{
 		Sqlite: db,
@@ -64,5 +89,9 @@ func InitStorage(sqlitePath, redisAddr, redisPass string, redisDB int) (*Databas
 
 // AcquireLock uses Redis to ensure single instance execution
 func (d *Database) AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	if d.Redis == nil {
+		// Redis 不可用时，始终返回 true（允许运行，无分布式锁保护）
+		return true, nil
+	}
 	return d.Redis.SetNX(ctx, key, "locked", ttl).Result()
 }

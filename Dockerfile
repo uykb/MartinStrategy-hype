@@ -16,7 +16,7 @@ FROM alpine:3.18
 
 WORKDIR /app
 
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates && mkdir -p /app/data
 
 COPY --from=builder /app/bot .
 
