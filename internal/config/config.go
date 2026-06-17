@@ -72,9 +72,9 @@ func LoadConfig(path string) (*Config, error) {
 	// 设置默认值（Docker 部署时无需 config.yaml）
 	viper.SetDefault("exchange.symbol", "HYPE")
 	viper.SetDefault("exchange.use_testnet", false)
-	viper.SetDefault("strategy.max_safety_orders", 8)
+	viper.SetDefault("strategy.max_safety_orders", 9)
 	viper.SetDefault("strategy.atr_period", 14)
-	viper.SetDefault("strategy.base_ratio", 0.1)
+	viper.SetDefault("strategy.base_ratio", 0.05)
 	viper.SetDefault("storage.sqlite_path", "bot.db")
 	viper.SetDefault("storage.redis_addr", "localhost:6379")
 	viper.SetDefault("storage.redis_db", 0)

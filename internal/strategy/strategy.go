@@ -696,34 +696,36 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 		return
 	}
 
-	// 预计算各周期 ATR
-	atr30m := s.fetchATR("30m")
+	// 预计算各周期 ATR（9 级网格：1h/2h/4h/8h/12h/1d/3d/1w/1M）
 	atr1h := s.fetchATR("1h")
 	atr2h := s.fetchATR("2h")
 	atr4h := s.fetchATR("4h")
 	atr8h := s.fetchATR("8h")
 	atr12h := s.fetchATR("12h")
 	atr1d := s.fetchATR("1d")
+	atr3d := s.fetchATR("3d")
 	atr1w := s.fetchATR("1w")
+	atr1M := s.fetchATR("1M")
 
-	if atr30m == 0 { atr30m = entryPrice * 0.01 }
 	if atr1h == 0 { atr1h = entryPrice * 0.01 }
 	if atr2h == 0 { atr2h = entryPrice * 0.01 }
 	if atr4h == 0 { atr4h = entryPrice * 0.01 }
 	if atr8h == 0 { atr8h = entryPrice * 0.01 }
 	if atr12h == 0 { atr12h = entryPrice * 0.01 }
 	if atr1d == 0 { atr1d = entryPrice * 0.01 }
+	if atr3d == 0 { atr3d = entryPrice * 0.01 }
 	if atr1w == 0 { atr1w = entryPrice * 0.01 }
+	if atr1M == 0 { atr1M = entryPrice * 0.01 }
 
 	minNotional := s.calcMinNotional()
 	unitQty := utils.RoundUpToTickSize(minNotional/entryPrice, s.stepSize)
 
 	utils.Logger.Info("放置网格订单",
 		zap.Float64("Entry", entryPrice),
-		zap.Float64("ATR30m", atr30m),
+		zap.Float64("ATR1h", atr1h),
 		zap.Float64("UnitQty", unitQty))
 
-	gridDistances := []float64{atr30m, atr1h, atr2h, atr4h, atr8h, atr12h, atr1d, atr1w}
+	gridDistances := []float64{atr1h, atr2h, atr4h, atr8h, atr12h, atr1d, atr3d, atr1w, atr1M}
 
 	currentPriceLevel := entryPrice
 
@@ -741,7 +743,7 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 		// ★ Hyperliquid 5 位有效数字截断
 		price = utils.RoundToSigFigs(price, 5, s.maxPriceDecimals)
 
-		volMult := s.getFibonacci(i)
+		volMult := s.getGridMultiplier(i)
 		qty := unitQty * float64(volMult)
 
 		if qty*price < minNotional {
@@ -947,14 +949,44 @@ func (s *MartingaleStrategy) calcMinNotional() float64 {
 	return notional
 }
 
-// getFibonacci 生成斐波那契数列
-func (s *MartingaleStrategy) getFibonacci(n int) int {
-	if n <= 0 {
-		return 0
+// getGridMultiplier 计算网格加仓数量倍数。
+//
+// 新的数量递增规则（从第三次开始斐波那契递增）：
+//
+//	层级  倍数    说明
+//	 1    1.0    首仓 = base_ratio
+//	 2    0.5    第一次加仓 = 1/2 × base_ratio
+//	 3    0.5    第二次加仓 = 1/2 × base_ratio
+//	 4    1.0    第三次加仓 = base_ratio
+//	 5    1.0    第四次加仓 = base_ratio
+//	 6    2.0    第五次加仓 = 第三次+第四次 = 1+1
+//	 7    3.0    第六次加仓 = 第四次+第五次 = 1+2
+//	 8    5.0    第七次加仓 = 第五次+第六次 = 2+3
+//	 9    8.0    第八次加仓 = 第六次+第七次 = 3+5
+//	...  斐波那契递增 ...
+//
+// 返回值以 0.5 为单位（即 base_ratio 的倍数 × 2），
+// 调用方乘以 unitQty 后再除以 2 得到实际数量。
+func (s *MartingaleStrategy) getGridMultiplier(level int) float64 {
+	// 前两层使用半仓
+	switch level {
+	case 1:
+		return 1.0 // 首仓 = base_ratio
+	case 2:
+		return 0.5 // 第一次加仓 = 1/2 × base_ratio
+	case 3:
+		return 0.5 // 第二次加仓 = 1/2 × base_ratio
+	case 4:
+		return 1.0 // 第三次加仓 = base_ratio
+	case 5:
+		return 1.0 // 第四次加仓 = base_ratio
+	default:
+		// 从第六层开始斐波那契递增：F(n-2) + F(n-1)
+		// level 6 → 2.0, level 7 → 3.0, level 8 → 5.0, level 9 → 8.0, ...
+		a, b := 1.0, 1.0 // 对应 level 4=1.0, level 5=1.0
+		for i := 6; i <= level; i++ {
+			a, b = b, a+b
+		}
+		return b
 	}
-	a, b := 1, 1
-	for i := 1; i < n; i++ {
-		a, b = b, a+b
-	}
-	return a
 }

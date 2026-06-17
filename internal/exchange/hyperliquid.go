@@ -659,8 +659,12 @@ func intervalToDuration(interval string) time.Duration {
 		return 12 * time.Hour
 	case "1d":
 		return 24 * time.Hour
+	case "3d":
+		return 3 * 24 * time.Hour
 	case "1w":
 		return 7 * 24 * time.Hour
+	case "1M":
+		return 30 * 24 * time.Hour
 	default:
 		return time.Hour // 默认 1 小时
 	}
