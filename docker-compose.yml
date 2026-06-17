@@ -1,0 +1,15 @@
+services:
+  martinstrategy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: martinstrategy
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    environment:
+      - MARTIN_EXCHANGE_API_KEY=${MARTIN_EXCHANGE_API_KEY}
+      - MARTIN_EXCHANGE_API_SECRET=${MARTIN_EXCHANGE_API_SECRET}
+volumes:
+  data:

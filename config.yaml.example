@@ -1,0 +1,34 @@
+# Hyperliquid 交易所配置
+# ⚠️ 复制此文件为 config.yaml 并填入真实密钥
+# ⚠️ 生产环境务必通过环境变量设置密钥，不要明文写入配置文件
+
+exchange:
+  api_key: ""           # Agent 钱包私钥（十六进制，不含 0x 前缀）
+                        # 通过环境变量 MARTIN_EXCHANGE_API_KEY 设置
+  api_secret: ""        # 主钱包地址（十六进制，含 0x 前缀）
+                        # 通过环境变量 MARTIN_EXCHANGE_API_SECRET 设置
+  symbol: "HYPE"        # 交易对名称（注意：不带 USDT 后缀）
+  use_testnet: false    # 是否使用测试网
+
+# 策略配置
+strategy:
+  max_safety_orders: 8  # 最大网格层数（Fibonacci 序列：1,1,2,3,5,8,13,21）
+  atr_period: 14        # ATR 计算周期
+  base_ratio: 0.1       # 头仓金额 = 账户 USDC 余额 × base_ratio（不低于 10 USDC）
+
+# 存储配置
+storage:
+  sqlite_path: "bot.db"
+  redis_addr: "localhost:6379"
+  redis_pass: ""
+  redis_db: 0
+
+# 日志配置
+log:
+  level: "info"
+
+# 健康检查配置
+# /healthz → liveness 探针（进程存活=200）
+# /readyz  → readiness 探针（WS 活跃 + FSM 未冻结=200）
+health:
+  addr: ":8080"

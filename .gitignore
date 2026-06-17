@@ -1,0 +1,27 @@
+# Build artifacts
+bot
+bot.exe
+
+# Data directory
+data/
+
+# Database
+*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — 绝不提交私钥和配置文件中的敏感信息
+config.yaml
+*.env
+.env
+
+# Go
+vendor/

@@ -1,0 +1,960 @@
+// Package strategy 实现马丁格尔网格策略的有限状态机 (FSM)。
+//
+// 安全加固说明（P0/P1 修复）：
+//   - 所有常驻 goroutine 添加 defer recover() + 5秒延迟自愈重启
+//   - handleTick 锁模式优化：网络 I/O 移出锁外
+//   - updateTP 锁模式优化：fetchATR 网络请求移出 RLock
+//   - 引入 PriceUpdate 时间戳防滑点：丢弃超过 2 秒的过期行情
+//   - 添加 Stop() 方法 + context 取消，支持优雅关闭
+//   - FSM 状态转移逻辑完全保留，未做任何修改
+package strategy
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/uykb/MartinStrategy/internal/config"
+	"github.com/uykb/MartinStrategy/internal/core"
+	"github.com/uykb/MartinStrategy/internal/exchange"
+	"github.com/uykb/MartinStrategy/internal/storage"
+	"github.com/uykb/MartinStrategy/internal/utils"
+	"go.uber.org/zap"
+)
+
+// ---------------------------------------------------------------------------
+// FSM 状态定义（完全保留，未修改）
+// ---------------------------------------------------------------------------
+
+// State 定义 FSM 状态
+type State string
+
+const (
+	StateIdle        State = "IDLE"         // 等待入场
+	StateInPosition  State = "IN_POSITION"  // 持仓中 + 网格已放置
+	StatePlacingGrid State = "PLACING_GRID" // 入场单已下，等待成交后放置网格
+	StateClosing     State = "CLOSING"      // 平仓中
+)
+
+// MinOrderValue 是最低下单金额（Hyperliquid 为 USDC，最低约 10 USDC）
+const MinOrderValue = 10.0
+
+// MaxTickStaleness 行情最大允许延迟（超过此时间的行情视为过期，丢弃不处理）
+const MaxTickStaleness = 2 * time.Second
+
+// ---------------------------------------------------------------------------
+// MartingaleStrategy 核心结构
+// ---------------------------------------------------------------------------
+
+// MartingaleStrategy 马丁格尔网格策略 FSM
+type MartingaleStrategy struct {
+	cfg      *config.StrategyConfig
+	exchange exchange.ExchangeAdapter
+	storage  *storage.Database
+	bus      *core.EventBus
+
+	mu               sync.RWMutex
+	currentState     State
+	position         *exchange.Position
+	activeOrders     map[int64]*exchange.OpenOrder
+	currentTPOrderID int64
+
+	// 交易对精度信息
+	quantityPrecision int
+	pricePrecision    int
+	minQty            float64
+	stepSize          float64
+	tickSize          float64
+	szDecimals        int
+	maxPriceDecimals  int
+
+	// 防重入锁
+	gridMu sync.Mutex // placeGridOrders 防并发
+	tpMu   sync.Mutex // updateTP 防并发
+
+	// waitForFillAndPlaceGrid stops when this channel is closed
+	waitStopCh chan struct{}
+
+	// 监控计数器
+	gridSkipCount int64
+	tpSkipCount   int64
+
+	// 状态标志
+	gridPlaced bool
+
+	// ★ P2 加固：对账冻结标志（atomic，对账期间 FSM 暂停处理 tick 和 orderUpdate）
+	frozen atomic.Bool
+
+	// ★ P1 加固：生命周期控制
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// NewMartingaleStrategy 创建策略实例
+func NewMartingaleStrategy(cfg *config.StrategyConfig, ex exchange.ExchangeAdapter, st *storage.Database, bus *core.EventBus) *MartingaleStrategy {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &MartingaleStrategy{
+		cfg:          cfg,
+		exchange:     ex,
+		storage:      st,
+		bus:          bus,
+		currentState: StateIdle,
+		activeOrders: make(map[int64]*exchange.OpenOrder),
+		waitStopCh:   make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
+
+// Stop 优雅停止策略（P1 加固：支持 context 取消）
+func (s *MartingaleStrategy) Stop() {
+	s.cancel()
+}
+
+// CurrentState 返回当前 FSM 状态字符串（供健康检查查询）
+func (s *MartingaleStrategy) CurrentState() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return string(s.currentState)
+}
+
+// IsFrozen 返回 FSM 是否处于对账冻结状态（供健康检查查询）
+func (s *MartingaleStrategy) IsFrozen() bool {
+	return s.frozen.Load()
+}
+
+// ---------------------------------------------------------------------------
+// 启动与监控
+// ---------------------------------------------------------------------------
+
+// Start 启动策略：初始化交易对信息 + 订阅事件 + 同步状态
+func (s *MartingaleStrategy) Start() {
+	// 初始化交易对精度信息
+	if err := s.initSymbolInfo(); err != nil {
+		utils.Logger.Fatal("初始化交易对信息失败", zap.Error(err))
+	}
+
+	// 订阅事件
+	s.bus.Subscribe(core.EventTick, s.handleTick)
+	s.bus.Subscribe(core.EventOrderUpdate, s.handleOrderUpdate)
+
+	// ★ P2 加固：订阅对账冻结/解冻事件
+	s.bus.Subscribe(core.EventResyncStart, s.handleResyncStart)
+	s.bus.Subscribe(core.EventResyncEnd, s.handleResyncEnd)
+
+	// 初始状态同步
+	s.syncState()
+
+	// 后台协程：定期检查持仓状态
+	go s.monitorPositionStatus()
+}
+
+// monitorPositionStatus 定期检查持仓状态
+// ★ P0 加固：添加 defer recover() + 5秒自愈重启 + context 取消
+func (s *MartingaleStrategy) monitorPositionStatus() {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Logger.Error("monitorPositionStatus panic 恢复",
+				zap.Any("recover", r),
+				zap.Stack("stack"))
+			// 自愈：5 秒后重启
+			go func() {
+				time.Sleep(5 * time.Second)
+				s.monitorPositionStatus()
+			}()
+		}
+	}()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			utils.Logger.Info("monitorPositionStatus: 收到停止信号，退出")
+			return
+		case <-ticker.C:
+			s.mu.RLock()
+			state := s.currentState
+			s.mu.RUnlock()
+
+			// 仅在 IN_POSITION 状态下检查
+			if state != StateInPosition {
+				continue
+			}
+
+			pos, err := s.exchange.GetPosition()
+			if err != nil {
+				utils.Logger.Error("monitorPositionStatus: 获取持仓失败", zap.Error(err))
+				continue
+			}
+
+			if math.Abs(pos.Size) == 0 {
+				utils.Logger.Info("monitorPositionStatus: 持仓已清零（可能手动平仓），重置状态为 IDLE")
+				s.mu.Lock()
+				s.currentState = StateIdle
+				s.gridPlaced = false
+				s.currentTPOrderID = 0
+				s.mu.Unlock()
+
+				s.exchange.CancelAllOrders()
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 交易对信息初始化
+// ---------------------------------------------------------------------------
+
+// initSymbolInfo 初始化交易对精度信息
+func (s *MartingaleStrategy) initSymbolInfo() error {
+	info, err := s.exchange.GetSymbolInfo()
+	if err != nil {
+		return fmt.Errorf("获取交易对信息失败: %w", err)
+	}
+
+	s.quantityPrecision = info.QuantityPrecision
+	s.pricePrecision = info.PricePrecision
+	s.minQty = info.MinQty
+	s.stepSize = info.StepSize
+	s.tickSize = info.TickSize
+	s.szDecimals = info.SzDecimals
+	s.maxPriceDecimals = info.MaxPriceDecimals
+
+	utils.Logger.Info("交易对信息初始化完成",
+		zap.String("symbol", s.exchange.GetSymbol()),
+		zap.Int("price_prec", s.pricePrecision),
+		zap.Int("qty_prec", s.quantityPrecision),
+		zap.Float64("step_size", s.stepSize),
+		zap.Float64("tick_size", s.tickSize),
+		zap.Float64("min_qty", s.minQty),
+		zap.Int("sz_decimals", s.szDecimals),
+		zap.Int("max_price_decimals", s.maxPriceDecimals),
+	)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 状态同步
+// ---------------------------------------------------------------------------
+
+// syncState 初始化时同步 FSM 状态
+func (s *MartingaleStrategy) syncState() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pos, err := s.exchange.GetPosition()
+	if err != nil {
+		utils.Logger.Error("同步持仓状态失败", zap.Error(err))
+		return
+	}
+	s.position = pos
+
+	if pos != nil && math.Abs(pos.Size) > 0 {
+		s.currentState = StateInPosition
+		s.gridPlaced = true
+		utils.Logger.Info("状态同步：检测到持仓",
+			zap.String("state", string(s.currentState)),
+			zap.Float64("size", pos.Size),
+			zap.Float64("entry_price", pos.EntryPrice))
+
+		orders, err := s.exchange.GetOpenOrders()
+		if err != nil {
+			utils.Logger.Error("获取挂单列表失败", zap.Error(err))
+		} else {
+			hasTP := false
+			for _, o := range orders {
+				if o.Side == exchange.OrderSideSell && o.Type == exchange.OrderTypeLimit {
+					hasTP = true
+					s.currentTPOrderID = o.OrderID
+					utils.Logger.Info("发现已有 TP 订单", zap.Int64("id", o.OrderID))
+					break
+				}
+			}
+
+			if !hasTP {
+				utils.Logger.Warn("检测到持仓但无 TP 订单，正在恢复 TP...")
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							utils.Logger.Error("syncState updateTP goroutine panic", zap.Any("recover", r))
+						}
+					}()
+					time.Sleep(100 * time.Millisecond)
+					s.updateTP()
+				}()
+			} else {
+				utils.Logger.Info("状态已恢复，TP 订单存在", zap.Int("open_orders", len(orders)))
+			}
+		}
+	} else {
+		s.currentState = StateIdle
+		s.gridPlaced = false
+		s.currentTPOrderID = 0
+		s.activeOrders = make(map[int64]*exchange.OpenOrder)
+		utils.Logger.Info("状态同步：无持仓", zap.String("state", string(s.currentState)))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 事件处理器（FSM 状态转移逻辑完全保留）
+// ---------------------------------------------------------------------------
+
+// handleTick 处理价格更新事件
+// ★ P1 加固：PriceUpdate 时间戳防滑点 + 锁模式优化（网络 I/O 移出锁外）
+// ★ P2 加固：对账冻结期间丢弃 tick，防止 FSM 在对账期间误触发状态转移
+func (s *MartingaleStrategy) handleTick(ctx context.Context, event core.Event) error {
+	// ★ P2 加固：对账冻结期间丢弃 tick
+	if s.frozen.Load() {
+		return nil
+	}
+
+	// ★ P1 加固：解析 PriceUpdate 并检查行情新鲜度
+	priceUpdate, ok := event.Data.(*exchange.PriceUpdate)
+	if !ok {
+		return fmt.Errorf("无效的 tick 数据: 期望 *exchange.PriceUpdate, 得到 %T", event.Data)
+	}
+
+	// ★ P1 加固：丢弃过期行情（超过 2 秒的陈旧价格）
+	if priceUpdate.IsStale(MaxTickStaleness) {
+		utils.Logger.Debug("丢弃过期 tick",
+			zap.Float64("price", priceUpdate.Price),
+			zap.Int64("timestamp_ms", priceUpdate.Timestamp))
+		return nil
+	}
+
+	price := priceUpdate.Price
+
+	utils.Logger.Info("收到 Tick",
+		zap.Float64("price", price),
+		zap.String("state", string(s.currentState)),
+		zap.Bool("gridPlaced", s.gridPlaced))
+
+	// ★ P1 加固：锁模式优化
+	// 在锁内完成状态检查和变更，在锁外执行网络 I/O
+	s.mu.Lock()
+	if s.currentState != StateIdle {
+		s.mu.Unlock()
+		return nil
+	}
+	utils.Logger.Info("状态为 IDLE，启动入场序列")
+	s.currentState = StatePlacingGrid
+	s.gridPlaced = false
+
+	// 关闭旧的 waitForFillAndPlaceGrid，启动新的
+	if s.waitStopCh != nil {
+		close(s.waitStopCh)
+	}
+	s.waitStopCh = make(chan struct{})
+	s.mu.Unlock() // ★ 在网络调用前释放锁
+
+	// 网络请求在锁外执行
+	if err := s.enterLong(price); err != nil {
+		// 下单失败，恢复状态
+		s.mu.Lock()
+		s.currentState = StateIdle
+		s.mu.Unlock()
+		utils.Logger.Error("enterLong 失败，重置为 IDLE", zap.Error(err))
+		return err
+	}
+
+	// 等待订单成交，然后放置网格
+	go s.waitForFillAndPlaceGrid()
+
+	return nil
+}
+
+// waitForFillAndPlaceGrid 等待入场单成交后放置网格订单
+// ★ P0 加固：添加 defer recover() + 5秒自愈重启
+func (s *MartingaleStrategy) waitForFillAndPlaceGrid() {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Logger.Error("waitForFillAndPlaceGrid panic 恢复",
+				zap.Any("recover", r),
+				zap.Stack("stack"))
+			// 自愈：5 秒后重新检查持仓状态
+			go func() {
+				time.Sleep(5 * time.Second)
+				s.mu.RLock()
+				state := s.currentState
+				s.mu.RUnlock()
+				if state == StatePlacingGrid {
+					// 仍在 PLACING_GRID 状态，重新尝试
+					s.waitForFillAndPlaceGrid()
+				}
+			}()
+		}
+	}()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.After(30 * time.Second)
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.waitStopCh:
+			utils.Logger.Info("waitForFillAndPlaceGrid: 通过 channel 停止")
+			return
+		case <-timeout:
+			utils.Logger.Warn("waitForFillAndPlaceGrid: 超时，未检测到持仓")
+			s.mu.Lock()
+			s.currentState = StateIdle
+			s.mu.Unlock()
+			return
+		case <-ticker.C:
+			s.mu.RLock()
+			state := s.currentState
+			s.mu.RUnlock()
+
+			if state != StatePlacingGrid {
+				utils.Logger.Info("waitForFillAndPlaceGrid: 状态已变更，中止",
+					zap.String("state", string(state)))
+				return
+			}
+
+			pos, err := s.exchange.GetPosition()
+			if err != nil {
+				utils.Logger.Error("获取持仓失败", zap.Error(err))
+				continue
+			}
+
+			if math.Abs(pos.Size) > 0 {
+				utils.Logger.Info("检测到持仓，开始放置网格订单",
+					zap.Float64("size", pos.Size),
+					zap.Float64("entry_price", pos.EntryPrice))
+				s.placeGridOrders(pos.EntryPrice)
+				return
+			}
+		}
+	}
+}
+
+// handleOrderUpdate 处理订单状态更新事件
+// ★ FSM 状态转移：IN_POSITION → IDLE（逻辑完全保留）
+// ★ P2 加固：对账冻结期间丢弃订单更新，防止 FSM 在对账期间误触发状态转移
+func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.Event) error {
+	// ★ P2 加固：对账冻结期间丢弃订单更新
+	if s.frozen.Load() {
+		return nil
+	}
+
+	order, ok := event.Data.(*exchange.OrderUpdate)
+	if !ok {
+		utils.Logger.Error("无效的订单更新数据",
+			zap.String("type", fmt.Sprintf("%T", event.Data)))
+		return fmt.Errorf("无效的订单更新数据: 期望 *exchange.OrderUpdate, 得到 %T", event.Data)
+	}
+
+	// 只处理配置的交易对订单
+	configuredSymbol := s.exchange.GetSymbol()
+	if order.Symbol != configuredSymbol {
+		utils.Logger.Debug("忽略非目标交易对的订单更新",
+			zap.String("order_symbol", order.Symbol),
+			zap.String("configured_symbol", configuredSymbol))
+		return nil
+	}
+
+	utils.Logger.Info("收到订单更新",
+		zap.Int64("id", order.OrderID),
+		zap.String("status", order.Status),
+		zap.String("side", string(order.Side)),
+		zap.String("type", string(order.Type)),
+	)
+
+	if order.Status == "FILLED" {
+		if order.Side == exchange.OrderSideBuy {
+			utils.Logger.Info("买单成交",
+				zap.String("type", string(order.Type)),
+				zap.Float64("execPrice", order.ExecPrice))
+
+			s.mu.Lock()
+			prevState := s.currentState
+			s.mu.Unlock()
+
+			s.mu.RLock()
+			gridPlaced := s.gridPlaced
+			s.mu.RUnlock()
+
+			if prevState == StateIdle || prevState == StatePlacingGrid {
+				if !gridPlaced {
+					utils.Logger.Info("基础订单成交，放置网格订单", zap.Float64("execPrice", order.ExecPrice))
+					s.mu.Lock()
+					s.currentState = StateInPosition
+					s.mu.Unlock()
+					go s.safePlaceGridOrders(order.ExecPrice)
+				} else {
+					utils.Logger.Info("基础订单成交但网格已放置，更新 TP", zap.Float64("execPrice", order.ExecPrice))
+					s.mu.Lock()
+					s.currentState = StateInPosition
+					s.mu.Unlock()
+					go s.safeUpdateTP()
+				}
+			} else {
+				utils.Logger.Info("安全订单成交，重新计算 TP", zap.Float64("execPrice", order.ExecPrice))
+				go s.safeUpdateTP()
+			}
+		} else if order.Side == exchange.OrderSideSell {
+			utils.Logger.Info("卖单成交 (TP/手动)。重置为 IDLE。",
+				zap.String("type", string(order.Type)),
+				zap.String("status", order.Status),
+			)
+
+			s.mu.Lock()
+			s.currentState = StateIdle
+			s.currentTPOrderID = 0
+			s.gridPlaced = false
+			utils.Logger.Info("卖单成交：状态重置为 IDLE", zap.Bool("gridPlaced", s.gridPlaced))
+			s.mu.Unlock()
+
+			s.exchange.CancelAllOrders()
+			utils.Logger.Info("卖单成交后已取消所有挂单")
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// ★ P2 加固：对账冻结/解冻事件处理器
+// ---------------------------------------------------------------------------
+
+// handleResyncStart 处理对账开始事件：冻结 FSM，暂停 tick 和订单更新处理
+func (s *MartingaleStrategy) handleResyncStart(ctx context.Context, event core.Event) error {
+	s.frozen.Store(true)
+	utils.Logger.Info("FSM 已冻结：REST 对账进行中，暂停 tick 和订单处理")
+	return nil
+}
+
+// handleResyncEnd 处理对账结束事件：解冻 FSM，恢复正常处理
+func (s *MartingaleStrategy) handleResyncEnd(ctx context.Context, event core.Event) error {
+	s.frozen.Store(false)
+	utils.Logger.Info("FSM 已解冻：REST 对账完成，恢复 tick 和订单处理")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// ★ P0 加固：带 panic 恢复的安全包装函数
+// ---------------------------------------------------------------------------
+
+// safePlaceGridOrders 是 placeGridOrders 的安全包装，带 panic 恢复和自愈
+func (s *MartingaleStrategy) safePlaceGridOrders(execPrice float64) {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Logger.Error("placeGridOrders panic 恢复",
+				zap.Any("recover", r),
+				zap.Stack("stack"))
+			// 自愈：5 秒后重试
+			go func() {
+				time.Sleep(5 * time.Second)
+				s.mu.RLock()
+				state := s.currentState
+				gridPlaced := s.gridPlaced
+				s.mu.RUnlock()
+				if state == StateInPosition && !gridPlaced {
+					s.safePlaceGridOrders(execPrice)
+				}
+			}()
+		}
+	}()
+	s.placeGridOrders(execPrice)
+}
+
+// safeUpdateTP 是 updateTP 的安全包装，带 panic 恢复和自愈
+func (s *MartingaleStrategy) safeUpdateTP() {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Logger.Error("updateTP panic 恢复",
+				zap.Any("recover", r),
+				zap.Stack("stack"))
+			// 自愈：5 秒后重试
+			go func() {
+				time.Sleep(5 * time.Second)
+				s.mu.RLock()
+				state := s.currentState
+				s.mu.RUnlock()
+				if state == StateInPosition {
+					s.safeUpdateTP()
+				}
+			}()
+		}
+	}()
+	s.updateTP()
+}
+
+// ---------------------------------------------------------------------------
+// 策略动作
+// ---------------------------------------------------------------------------
+
+// enterLong 入场做多
+func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
+	utils.Logger.Info("正在入场做多...")
+
+	minNotional := s.calcMinNotional()
+	unitQtyRaw := minNotional / currentPrice
+	unitQty := utils.RoundUpToTickSize(unitQtyRaw, s.stepSize)
+
+	if unitQty < s.minQty {
+		unitQty = s.minQty
+	}
+
+	baseQty := unitQty * 1.0
+	baseQty = utils.ToFixed(baseQty, s.quantityPrecision)
+
+	utils.Logger.Info("计算基础下单量",
+		zap.Float64("price", currentPrice),
+		zap.Float64("unit_qty", unitQty),
+		zap.Float64("base_qty", baseQty),
+	)
+
+	_, err := s.exchange.CreateOrder(exchange.OrderSideBuy, exchange.OrderTypeMarket, baseQty, currentPrice)
+	if err != nil {
+		utils.Logger.Error("基础订单下单失败", zap.Error(err))
+		return err
+	}
+
+	return nil
+}
+
+// placeGridOrders 放置网格安全订单
+func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
+	utils.Logger.Info("placeGridOrders 开始", zap.Float64("execPrice", execPrice))
+
+	// 检查网格是否已放置，防止重复
+	s.mu.RLock()
+	if s.gridPlaced {
+		s.mu.RUnlock()
+		utils.Logger.Warn("placeGridOrders 跳过：网格已放置")
+		return
+	}
+	s.mu.RUnlock()
+
+	// 检查是否已有活跃的网格订单（防止重启后重复放置）
+	existingOrders, err := s.exchange.GetOpenOrders()
+	if err == nil && len(existingOrders) > 0 {
+		gridCount := 0
+		for _, o := range existingOrders {
+			if o.Side == exchange.OrderSideBuy {
+				gridCount++
+			}
+		}
+		if gridCount > 0 {
+			utils.Logger.Warn("placeGridOrders 跳过：发现已有网格订单",
+				zap.Int("existing_grid_count", gridCount),
+				zap.Int("total_orders", len(existingOrders)))
+			s.mu.Lock()
+			s.gridPlaced = true
+			s.mu.Unlock()
+			return
+		}
+	}
+
+	// 防并发
+	if !s.gridMu.TryLock() {
+		s.mu.Lock()
+		s.gridSkipCount++
+		skipCount := s.gridSkipCount
+		s.mu.Unlock()
+		utils.Logger.Warn("placeGridOrders 跳过：已在执行中",
+			zap.Int64("skip_count", skipCount))
+		return
+	}
+	defer s.gridMu.Unlock()
+
+	// 再次检查（获取锁后）
+	s.mu.RLock()
+	if s.gridPlaced {
+		s.mu.RUnlock()
+		utils.Logger.Warn("placeGridOrders 跳过：网格已放置（获取锁后）")
+		return
+	}
+	s.mu.RUnlock()
+
+	var entryPrice float64
+
+	if execPrice > 0 {
+		entryPrice = execPrice
+		utils.Logger.Info("使用订单事件中的成交价", zap.Float64("entryPrice", entryPrice))
+	} else {
+		pos, err := s.exchange.GetPosition()
+		if err != nil {
+			utils.Logger.Error("获取持仓信息失败", zap.Error(err))
+			return
+		}
+		entryPrice = pos.EntryPrice
+		utils.Logger.Info("使用持仓 API 中的入场价", zap.Float64("entryPrice", entryPrice))
+	}
+
+	if entryPrice <= 0 {
+		utils.Logger.Error("无效的入场价，无法放置网格订单", zap.Float64("entryPrice", entryPrice))
+		return
+	}
+
+	// 预计算各周期 ATR
+	atr30m := s.fetchATR("30m")
+	atr1h := s.fetchATR("1h")
+	atr2h := s.fetchATR("2h")
+	atr4h := s.fetchATR("4h")
+	atr8h := s.fetchATR("8h")
+	atr12h := s.fetchATR("12h")
+	atr1d := s.fetchATR("1d")
+	atr1w := s.fetchATR("1w")
+
+	if atr30m == 0 { atr30m = entryPrice * 0.01 }
+	if atr1h == 0 { atr1h = entryPrice * 0.01 }
+	if atr2h == 0 { atr2h = entryPrice * 0.01 }
+	if atr4h == 0 { atr4h = entryPrice * 0.01 }
+	if atr8h == 0 { atr8h = entryPrice * 0.01 }
+	if atr12h == 0 { atr12h = entryPrice * 0.01 }
+	if atr1d == 0 { atr1d = entryPrice * 0.01 }
+	if atr1w == 0 { atr1w = entryPrice * 0.01 }
+
+	minNotional := s.calcMinNotional()
+	unitQty := utils.RoundUpToTickSize(minNotional/entryPrice, s.stepSize)
+
+	utils.Logger.Info("放置网格订单",
+		zap.Float64("Entry", entryPrice),
+		zap.Float64("ATR30m", atr30m),
+		zap.Float64("UnitQty", unitQty))
+
+	gridDistances := []float64{atr30m, atr1h, atr2h, atr4h, atr8h, atr12h, atr1d, atr1w}
+
+	currentPriceLevel := entryPrice
+
+	for i := 1; i <= s.cfg.MaxSafetyOrders; i++ {
+		stepDist := 0.0
+		if i-1 < len(gridDistances) {
+			stepDist = gridDistances[i-1]
+		} else {
+			stepDist = gridDistances[len(gridDistances)-1]
+		}
+
+		price := currentPriceLevel - stepDist
+		currentPriceLevel = price
+
+		// ★ Hyperliquid 5 位有效数字截断
+		price = utils.RoundToSigFigs(price, 5, s.maxPriceDecimals)
+
+		volMult := s.getFibonacci(i)
+		qty := unitQty * float64(volMult)
+
+		if qty*price < minNotional {
+			utils.Logger.Info("调整数量以满足最低下单金额",
+				zap.Int("index", i),
+				zap.Float64("old_qty", qty),
+				zap.Float64("price", price),
+			)
+			qty = minNotional / price
+		}
+
+		qty = utils.RoundUpToTickSize(qty, s.stepSize)
+		qty = utils.ToFixed(qty, s.quantityPrecision)
+
+		utils.Logger.Info("放置安全订单",
+			zap.Int("index", i),
+			zap.Float64("price", price),
+			zap.Float64("qty", qty),
+			zap.Float64("dist_atr", stepDist),
+		)
+
+		// ★ P1 加固：带重试的下单逻辑（3次重试 + 抖动退避）
+		s.placeOrderWithRetry(exchange.OrderSideBuy, exchange.OrderTypeLimit, qty, price, i)
+
+		// 避免 API 限流
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// 放置初始 TP
+	s.updateTP()
+
+	// 标记网格已放置
+	s.mu.Lock()
+	s.gridPlaced = true
+	s.mu.Unlock()
+	utils.Logger.Info("网格订单放置完成，gridPlaced=true")
+}
+
+// placeOrderWithRetry 带重试的下单逻辑（3次重试 + 抖动指数退避）
+func (s *MartingaleStrategy) placeOrderWithRetry(side exchange.OrderSide, orderType exchange.OrderTypeKind, qty, price float64, level int) {
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		_, err := s.exchange.CreateOrder(side, orderType, qty, price)
+		if err == nil {
+			return // 成功
+		}
+
+		if attempt < maxRetries-1 {
+			// 抖动指数退避：200ms × 2^attempt + 随机抖动
+			backoff := time.Duration(200*(1<<attempt)) * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+			utils.Logger.Warn("网格订单重试",
+				zap.Int("index", level),
+				zap.Int("attempt", attempt+1),
+				zap.Duration("backoff", backoff+jitter),
+				zap.Error(err))
+			time.Sleep(backoff + jitter)
+		} else {
+			utils.Logger.Error("网格订单最终失败",
+				zap.Int("index", level),
+				zap.Int("max_retries", maxRetries),
+				zap.Error(err))
+		}
+	}
+}
+
+// updateTP 更新止盈订单
+// ★ P1 加固：网络 I/O（fetchATR）移出 RLock，先读取状态再释放锁
+func (s *MartingaleStrategy) updateTP() {
+	utils.Logger.Info("updateTP 开始")
+
+	// 防并发
+	if !s.tpMu.TryLock() {
+		s.mu.Lock()
+		s.tpSkipCount++
+		skipCount := s.tpSkipCount
+		s.mu.Unlock()
+		utils.Logger.Warn("updateTP 跳过：已在执行中",
+			zap.Int64("skip_count", skipCount))
+		return
+	}
+	defer s.tpMu.Unlock()
+
+	utils.Logger.Info("updateTP 获取锁成功")
+
+	// 1. 获取更新后的持仓
+	pos, err := s.exchange.GetPosition()
+	if err != nil {
+		utils.Logger.Error("获取持仓信息失败（TP 更新）", zap.Error(err))
+		return
+	}
+
+	// 如果持仓已清零，不需要 TP
+	if math.Abs(pos.Size) == 0 {
+		s.mu.Lock()
+		s.currentTPOrderID = 0
+		s.mu.Unlock()
+		return
+	}
+
+	// ★ P1 加固：先在锁内读取必要变量，迅速释放锁，再在锁外发起网络请求
+	s.mu.RLock()
+	isIdle := s.currentState == StateIdle
+	oldTPID := s.currentTPOrderID
+	s.mu.RUnlock()
+
+	// 安全检查：如果状态为 IDLE，不更新 TP
+	if isIdle {
+		return
+	}
+
+	// ★ 网络请求在锁外执行（不再持有 RLock）
+	atr30m := s.fetchATR("30m")
+	if atr30m == 0 {
+		atr30m = pos.EntryPrice * 0.01
+	}
+
+	tpPrice := pos.EntryPrice + atr30m
+
+	// 3. 取消旧 TP
+	if oldTPID != 0 {
+		utils.Logger.Info("取消旧 TP", zap.Int64("id", oldTPID))
+		if err := s.exchange.CancelOrder(oldTPID); err != nil {
+			utils.Logger.Warn("取消旧 TP 失败（可能已成交或已取消）", zap.Error(err))
+		}
+	}
+
+	// 4. 放置新 TP
+	tpPrice = utils.RoundToSigFigs(tpPrice, 5, s.maxPriceDecimals)
+	tpQty := utils.ToFixed(math.Abs(pos.Size), s.quantityPrecision)
+
+	utils.Logger.Info("更新 TP",
+		zap.Float64("Price", tpPrice),
+		zap.Float64("Qty", tpQty))
+
+	resp, err := s.exchange.CreateOrder(exchange.OrderSideSell, exchange.OrderTypeLimit, tpQty, tpPrice)
+	if err != nil {
+		utils.Logger.Error("TP 订单下单失败", zap.Error(err))
+		return
+	}
+
+	s.mu.Lock()
+	if s.currentState == StateIdle {
+		s.mu.Unlock()
+		utils.Logger.Info("TP 更新期间周期已结束，取消新 TP", zap.Int64("id", resp.OrderID))
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					utils.Logger.Error("取消 TP goroutine panic", zap.Any("recover", r))
+				}
+			}()
+			s.exchange.CancelOrder(resp.OrderID)
+		}()
+		return
+	}
+	s.currentTPOrderID = resp.OrderID
+	s.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// 辅助方法
+// ---------------------------------------------------------------------------
+
+// fetchATR 获取指定周期的 ATR 值
+func (s *MartingaleStrategy) fetchATR(interval string) float64 {
+	utils.Logger.Info("fetchATR 调用", zap.String("interval", interval))
+
+	candles, err := s.exchange.GetKlines(interval, 50)
+	if err != nil {
+		utils.Logger.Error("获取 K 线数据失败", zap.String("interval", interval), zap.Error(err))
+		return 0
+	}
+	utils.Logger.Info("fetchATR 获取到 K 线数据",
+		zap.String("interval", interval),
+		zap.Int("count", len(candles)))
+
+	var highs, lows, closes []float64
+	for _, k := range candles {
+		highs = append(highs, k.High)
+		lows = append(lows, k.Low)
+		closes = append(closes, k.Close)
+	}
+
+	return utils.CalculateATR(highs, lows, closes, s.cfg.AtrPeriod)
+}
+
+// calcMinNotional 动态计算最低下单金额
+func (s *MartingaleStrategy) calcMinNotional() float64 {
+	balance, err := s.exchange.GetBalance()
+	if err != nil {
+		utils.Logger.Error("获取余额失败，使用 MinOrderValue", zap.Error(err))
+		return MinOrderValue
+	}
+	notional := balance * s.cfg.BaseRatio
+	if notional < MinOrderValue {
+		notional = MinOrderValue
+	}
+	utils.Logger.Info("动态 MinNotional",
+		zap.Float64("balance", balance),
+		zap.Float64("ratio", s.cfg.BaseRatio),
+		zap.Float64("notional", notional))
+	return notional
+}
+
+// getFibonacci 生成斐波那契数列
+func (s *MartingaleStrategy) getFibonacci(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	a, b := 1, 1
+	for i := 1; i < n; i++ {
+		a, b = b, a+b
+	}
+	return a
+}
