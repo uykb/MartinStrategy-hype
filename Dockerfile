@@ -19,11 +19,11 @@ WORKDIR /app
 RUN apk --no-cache add ca-certificates
 
 COPY --from=builder /app/bot .
-COPY --from=builder /app/config.yaml.example ./config.yaml.example
 
-# config.yaml 通过 docker-compose volume 挂载，不打包进镜像
-# 首次部署：cp config.yaml.example config.yaml && 编辑填入密钥
-
+# 健康检查端口
 EXPOSE 8080
 
+# 所有配置通过环境变量注入，无需 config.yaml
+# 必需：MARTIN_EXCHANGE_API_KEY, MARTIN_EXCHANGE_API_SECRET
+# 可选：MARTIN_EXCHANGE_SYMBOL (默认 HYPE), MARTIN_LOG_LEVEL (默认 info) 等
 CMD ["./bot"]
