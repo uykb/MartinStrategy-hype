@@ -614,10 +614,10 @@ func fillToOrderUpdate(fill hyperliquid.Fill, symbol string) *OrderUpdate {
 		update.Quantity = sz
 	}
 
-	// 转换方向
+	// 转换方向：Hyperliquid "B"=Bid=Buy, "A"=Ask=Sell
 	if fill.Side == "B" {
 		update.Side = OrderSideBuy
-	} else {
+	} else { // "A"
 		update.Side = OrderSideSell
 	}
 
@@ -820,10 +820,10 @@ func (w *WSManager) handleUserFills(data json.RawMessage) {
 			Status:    "FILLED",
 		}
 
-		// 转换方向
+		// 转换方向：Hyperliquid "B"=Bid=Buy, "A"=Ask=Sell
 		if fill.Side == "B" {
 			update.Side = OrderSideBuy
-		} else {
+		} else { // "A"
 			update.Side = OrderSideSell
 		}
 
@@ -869,10 +869,10 @@ func (w *WSManager) handleOrderUpdates(data json.RawMessage) {
 			Status:  ou.Status,
 		}
 
-		// 转换方向
+		// 转换方向：Hyperliquid "B"=Bid=Buy, "A"=Ask=Sell
 		if ou.Order.Side == "B" {
 			update.Side = OrderSideBuy
-		} else {
+		} else { // "A"
 			update.Side = OrderSideSell
 		}
 

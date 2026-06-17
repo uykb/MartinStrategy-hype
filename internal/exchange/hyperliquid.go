@@ -497,7 +497,7 @@ func (h *HyperliquidAdapter) GetOpenOrders() ([]OpenOrder, error) {
 
 		// SDK 的 OpenOrder.LimitPx 和 Size 已经是 float64 类型
 		side := OrderSideBuy
-		if o.Side == "S" {
+		if o.Side == "A" { // Hyperliquid: "A"=Ask=Sell, "B"=Bid=Buy
 			side = OrderSideSell
 		}
 
