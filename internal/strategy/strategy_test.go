@@ -79,6 +79,8 @@ func (m *mockAdapter) Start(ctx context.Context) error { return nil }
 func (m *mockAdapter) Stop() error                     { return nil }
 
 func (m *mockAdapter) GetLatestPrice() (float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.posEntryPrice, nil
 }
 
@@ -177,6 +179,15 @@ func (m *mockAdapter) GetSymbolInfo() (*exchange.SymbolInfo, error) {
 	}, nil
 }
 
+// setPos 线程安全地设置持仓状态，供并发测试使用。
+// 直接写 mockAdapter.posSize 字段会绕过 mu 锁，与 GetPosition 的读取产生数据竞争。
+func (m *mockAdapter) setPos(size, entryPrice float64) {
+	m.mu.Lock()
+	m.posSize = size
+	m.posEntryPrice = entryPrice
+	m.mu.Unlock()
+}
+
 // setKlines 设置指定周期的 K 线数据，使 ATR 计算返回可预测的值。
 func (m *mockAdapter) setKlines(interval string, count int, price float64) {
 	candles := make([]exchange.Candle, count)
@@ -231,8 +242,7 @@ func newTestStrategy(t *testing.T, adapter *mockAdapter) *MartingaleStrategy {
 
 // setupInPosition 将策略设置为 IN_POSITION 状态，模拟已有持仓和 TP。
 func setupInPosition(s *MartingaleStrategy, adapter *mockAdapter, posSize, entryPrice float64, tpID int64) {
-	adapter.posSize = posSize
-	adapter.posEntryPrice = entryPrice
+	adapter.setPos(posSize, entryPrice)
 
 	s.mu.Lock()
 	s.currentState = StateInPosition
@@ -400,7 +410,7 @@ func TestUpdateTP_ZeroPosition_ClearsTP(t *testing.T) {
 	s.mu.Unlock()
 
 	// 持仓清零
-	adapter.posSize = 0
+	adapter.setPos(0, 50.0)
 
 	s.tpMu.Lock()
 	s.updateTP()
@@ -477,8 +487,7 @@ func TestSafeUpdateTP_ConcurrentFills_DirtyFlag(t *testing.T) {
 	tpID := int64(10001)
 
 	// 初始持仓 100
-	adapter.posSize = 100.0
-	adapter.posEntryPrice = entryPrice
+	adapter.setPos(100.0, entryPrice)
 	adapter.setKlines("30m", 50, entryPrice)
 
 	s.mu.Lock()
@@ -489,7 +498,7 @@ func TestSafeUpdateTP_ConcurrentFills_DirtyFlag(t *testing.T) {
 	s.mu.Unlock()
 
 	// 第一次安全订单成交，仓位变为 150
-	adapter.posSize = 150.0
+	adapter.setPos(150.0, entryPrice)
 
 	// 启动第一次 safeUpdateTP（在 goroutine 中）
 	done := make(chan struct{})
@@ -501,8 +510,8 @@ func TestSafeUpdateTP_ConcurrentFills_DirtyFlag(t *testing.T) {
 	// 等待第一次 updateTP 开始执行（获取 tpMu）
 	time.Sleep(50 * time.Millisecond)
 
-	// 第二次安全订单成交，仓位变为 200
-	adapter.posSize = 200.0
+	// 第二次安全订单成交，仓位变为 200（线程安全写入，避免与 GetPosition 的读取竞争）
+	adapter.setPos(200.0, entryPrice)
 
 	// 尝试触发第二次 safeUpdateTP（应被 TryLock 拦截，标记 dirty）
 	go s.safeUpdateTP()
@@ -530,8 +539,7 @@ func TestUpdateTP_IdleState_SkipsUpdate(t *testing.T) {
 	s := newTestStrategy(t, adapter)
 
 	// 设置持仓但状态为 IDLE
-	adapter.posSize = 100.0
-	adapter.posEntryPrice = 50.0
+	adapter.setPos(100.0, 50.0)
 
 	s.mu.Lock()
 	s.currentState = StateIdle
