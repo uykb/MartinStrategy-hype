@@ -63,6 +63,16 @@ type MartingaleStrategy struct {
 	activeOrders     map[int64]*exchange.OpenOrder
 	currentTPOrderID int64
 
+	// ★ TP 状态跟踪：用于检测仓位变化，避免无变化的冗余更新
+	// lastTPQty / lastTPPrice 以 quantityPrecision 截断后的值存储，
+	// 与实际下单精度一致，避免浮点精度差异误判。
+	lastTPQty   float64 // 上次 TP 下单数量（精度截断后）
+	lastTPPrice float64 // 上次 TP 下单价格（5 位有效数字截断后）
+
+	// tpDirty 标志：并发场景下新的 updateTP 请求被跳过时标记 dirty，
+	// 当前 updateTP 完成后检查 dirty 并重跑，确保 TP 始终与仓位一致。
+	tpDirty atomic.Bool
+
 	// 交易对精度信息
 	quantityPrecision int
 	pricePrecision    int
@@ -142,6 +152,9 @@ func (s *MartingaleStrategy) Start() {
 	s.bus.Subscribe(core.EventTick, s.handleTick)
 	s.bus.Subscribe(core.EventOrderUpdate, s.handleOrderUpdate)
 
+	// ★ 订阅持仓更新事件（REST 对账后用实际持仓校准 TP）
+	s.bus.Subscribe(core.EventPositionUpdate, s.handlePositionUpdate)
+
 	// ★ P2 加固：订阅对账冻结/解冻事件
 	s.bus.Subscribe(core.EventResyncStart, s.handleResyncStart)
 	s.bus.Subscribe(core.EventResyncEnd, s.handleResyncEnd)
@@ -199,6 +212,10 @@ func (s *MartingaleStrategy) monitorPositionStatus() {
 				s.currentState = StateIdle
 				s.gridPlaced = false
 				s.currentTPOrderID = 0
+				s.lastTPQty = 0
+				s.lastTPPrice = 0
+				s.position = nil
+				s.activeOrders = make(map[int64]*exchange.OpenOrder)
 				s.mu.Unlock()
 
 				s.exchange.CancelAllOrders()
@@ -286,7 +303,7 @@ func (s *MartingaleStrategy) syncState() {
 						}
 					}()
 					time.Sleep(100 * time.Millisecond)
-					s.updateTP()
+					s.safeUpdateTP()
 				}()
 			} else {
 				utils.Logger.Info("状态已恢复，TP 订单存在", zap.Int("open_orders", len(orders)))
@@ -296,6 +313,9 @@ func (s *MartingaleStrategy) syncState() {
 		s.currentState = StateIdle
 		s.gridPlaced = false
 		s.currentTPOrderID = 0
+		s.lastTPQty = 0
+		s.lastTPPrice = 0
+		s.position = nil
 		s.activeOrders = make(map[int64]*exchange.OpenOrder)
 		utils.Logger.Info("状态同步：无持仓", zap.String("state", string(s.currentState)))
 	}
@@ -511,6 +531,10 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 			s.currentState = StateIdle
 			s.currentTPOrderID = 0
 			s.gridPlaced = false
+			s.lastTPQty = 0
+			s.lastTPPrice = 0
+			s.position = nil
+			s.activeOrders = make(map[int64]*exchange.OpenOrder)
 			utils.Logger.Info("卖单成交：状态重置为 IDLE", zap.Bool("gridPlaced", s.gridPlaced))
 			s.mu.Unlock()
 
@@ -536,6 +560,55 @@ func (s *MartingaleStrategy) handleResyncStart(ctx context.Context, event core.E
 func (s *MartingaleStrategy) handleResyncEnd(ctx context.Context, event core.Event) error {
 	s.frozen.Store(false)
 	utils.Logger.Info("FSM 已解冻：REST 对账完成，恢复 tick 和订单处理")
+	return nil
+}
+
+// handlePositionUpdate 处理持仓更新事件（由 REST 对账发布）。
+//
+// 当 WSManager 在重连对账后发布实际持仓时，此处理器用真实持仓校准 TP：
+//   - 持仓 > 0 且 FSM 处于 IN_POSITION → 触发 safeUpdateTP（仓位变化检测会决定是否实际更新）
+//   - 持仓 = 0 但 FSM 非 IDLE → 重置为 IDLE（可能手动平仓或 TP 已成交但事件丢失）
+func (s *MartingaleStrategy) handlePositionUpdate(ctx context.Context, event core.Event) error {
+	pos, ok := event.Data.(*exchange.Position)
+	if !ok {
+		utils.Logger.Error("无效的持仓更新数据",
+			zap.String("type", fmt.Sprintf("%T", event.Data)))
+		return fmt.Errorf("无效的持仓更新数据: 期望 *exchange.Position, 得到 %T", event.Data)
+	}
+
+	utils.Logger.Info("收到持仓更新事件",
+		zap.Float64("size", pos.Size),
+		zap.Float64("entry_price", pos.EntryPrice))
+
+	s.mu.Lock()
+	state := s.currentState
+	s.position = pos
+	s.mu.Unlock()
+
+	if math.Abs(pos.Size) > 0 {
+		// 有持仓：若处于 IN_POSITION，触发 TP 校准
+		if state == StateInPosition {
+			utils.Logger.Info("持仓更新：触发 TP 校准", zap.Float64("size", pos.Size))
+			go s.safeUpdateTP()
+		}
+	} else {
+		// 无持仓但 FSM 非 IDLE：重置状态
+		if state != StateIdle {
+			utils.Logger.Info("持仓更新：持仓为零但状态非 IDLE，重置为 IDLE",
+				zap.String("prev_state", string(state)))
+			s.mu.Lock()
+			s.currentState = StateIdle
+			s.gridPlaced = false
+			s.currentTPOrderID = 0
+			s.lastTPQty = 0
+			s.lastTPPrice = 0
+			s.position = nil
+			s.activeOrders = make(map[int64]*exchange.OpenOrder)
+			s.mu.Unlock()
+			s.exchange.CancelAllOrders()
+		}
+	}
+
 	return nil
 }
 
@@ -566,7 +639,14 @@ func (s *MartingaleStrategy) safePlaceGridOrders(execPrice float64) {
 	s.placeGridOrders(execPrice)
 }
 
-// safeUpdateTP 是 updateTP 的安全包装，带 panic 恢复和自愈
+// safeUpdateTP 是 updateTP 的安全包装，带 panic 恢复、自愈和并发脏标志。
+//
+// 并发处理策略：
+//   - 使用 TryLock 避免多个 goroutine 阻塞等待
+//   - 若 TryLock 失败（已有 updateTP 在执行），标记 tpDirty=true 并返回
+//   - 当前 updateTP 完成后检查 tpDirty，若为 true 则重跑，确保 TP 始终与仓位一致
+//
+// 这解决了原来并发成交时 updateTP 被静默跳过导致 TP 数量过期的问题。
 func (s *MartingaleStrategy) safeUpdateTP() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -585,7 +665,30 @@ func (s *MartingaleStrategy) safeUpdateTP() {
 			}()
 		}
 	}()
+
+	// 尝试获取锁，失败则标记 dirty 让当前执行者完成后重跑
+	if !s.tpMu.TryLock() {
+		s.tpDirty.Store(true)
+		s.mu.Lock()
+		s.tpSkipCount++
+		skipCount := s.tpSkipCount
+		s.mu.Unlock()
+		utils.Logger.Warn("updateTP 跳过：已在执行中，标记 dirty",
+			zap.Int64("skip_count", skipCount))
+		return
+	}
+	defer s.tpMu.Unlock()
+
+	// 清除 dirty 后执行，执行期间若有新的请求会重新标记 dirty
+	s.tpDirty.Store(false)
 	s.updateTP()
+
+	// 若执行期间有新的 updateTP 请求被跳过（dirty=true），重跑
+	for s.tpDirty.Load() {
+		s.tpDirty.Store(false)
+		utils.Logger.Info("检测到 dirty 标志，重跑 updateTP")
+		s.updateTP()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -773,7 +876,7 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 	}
 
 	// 放置初始 TP
-	s.updateTP()
+	s.safeUpdateTP()
 
 	// 标记网格已放置
 	s.mu.Lock()
@@ -812,23 +915,16 @@ func (s *MartingaleStrategy) placeOrderWithRetry(side exchange.OrderSide, orderT
 }
 
 // updateTP 更新止盈订单
-// ★ P1 加固：网络 I/O（fetchATR）移出 RLock，先读取状态再释放锁
+//
+// 核心逻辑（P1 加固 + 仓位变化检测 + modify 优先）：
+//   - 仓位大小未变化时跳过更新（不获取 ATR，不修改 TP）
+//   - 仓位大小变化时重新获取 ATR(30m) 计算止盈位置
+//   - 优先使用 ModifyOrder 原子替换，避免取消+重建的空窗期
+//   - Modify 失败时降级到 cancel + create
+//
+// 调用约定：调用方（safeUpdateTP）必须已持有 tpMu 锁。
 func (s *MartingaleStrategy) updateTP() {
 	utils.Logger.Info("updateTP 开始")
-
-	// 防并发
-	if !s.tpMu.TryLock() {
-		s.mu.Lock()
-		s.tpSkipCount++
-		skipCount := s.tpSkipCount
-		s.mu.Unlock()
-		utils.Logger.Warn("updateTP 跳过：已在执行中",
-			zap.Int64("skip_count", skipCount))
-		return
-	}
-	defer s.tpMu.Unlock()
-
-	utils.Logger.Info("updateTP 获取锁成功")
 
 	// 1. 获取更新后的持仓
 	pos, err := s.exchange.GetPosition()
@@ -841,7 +937,10 @@ func (s *MartingaleStrategy) updateTP() {
 	if math.Abs(pos.Size) == 0 {
 		s.mu.Lock()
 		s.currentTPOrderID = 0
+		s.lastTPQty = 0
+		s.lastTPPrice = 0
 		s.mu.Unlock()
+		utils.Logger.Info("持仓已清零，清除 TP 状态")
 		return
 	}
 
@@ -849,22 +948,85 @@ func (s *MartingaleStrategy) updateTP() {
 	s.mu.RLock()
 	isIdle := s.currentState == StateIdle
 	oldTPID := s.currentTPOrderID
+	prevQty := s.lastTPQty
 	s.mu.RUnlock()
 
 	// 安全检查：如果状态为 IDLE，不更新 TP
 	if isIdle {
+		utils.Logger.Info("updateTP 跳过：状态为 IDLE")
 		return
 	}
 
-	// ★ 网络请求在锁外执行（不再持有 RLock）
+	// 精度截断后的当前仓位数量（与实际下单精度一致，避免浮点误差误判）
+	newQty := utils.ToFixed(math.Abs(pos.Size), s.quantityPrecision)
+
+	// ★ 仓位变化检测：如果仓位未变且已有 TP 订单，跳过更新
+	// 此时不获取 ATR、不修改 TP 价格，符合"仓位未变不更新止盈位置"的需求
+	if newQty == prevQty && oldTPID != 0 {
+		utils.Logger.Debug("updateTP 跳过：仓位未变化",
+			zap.Float64("qty", newQty),
+			zap.Float64("prev_qty", prevQty),
+			zap.Int64("tp_id", oldTPID))
+		return
+	}
+
+	utils.Logger.Info("仓位变化，更新 TP",
+		zap.Float64("prev_qty", prevQty),
+		zap.Float64("new_qty", newQty),
+		zap.Int64("old_tp_id", oldTPID))
+
+	// ★ 仓位已变化 → 重新获取止盈位置（网络请求在锁外执行）
 	atr30m := s.fetchATR("30m")
 	if atr30m == 0 {
 		atr30m = pos.EntryPrice * 0.01
 	}
 
-	tpPrice := pos.EntryPrice + atr30m
+	tpPrice := utils.RoundToSigFigs(pos.EntryPrice+atr30m, 5, s.maxPriceDecimals)
 
-	// 3. 取消旧 TP
+	utils.Logger.Info("计算新 TP",
+		zap.Float64("entry_price", pos.EntryPrice),
+		zap.Float64("atr30m", atr30m),
+		zap.Float64("tp_price", tpPrice),
+		zap.Float64("tp_qty", newQty))
+
+	// ★ 优先使用 ModifyOrder 原子替换（避免取消+重建的空窗期）
+	if oldTPID != 0 {
+		resp, modErr := s.exchange.ModifyOrder(oldTPID, exchange.OrderSideSell, exchange.OrderTypeLimit, newQty, tpPrice)
+		if modErr == nil {
+			s.mu.Lock()
+			if s.currentState == StateIdle {
+				s.mu.Unlock()
+				utils.Logger.Info("Modify 成功但周期已结束，取消新 TP", zap.Int64("id", resp.OrderID))
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							utils.Logger.Error("取消 TP goroutine panic", zap.Any("recover", r))
+						}
+					}()
+					s.exchange.CancelOrder(resp.OrderID)
+				}()
+				return
+			}
+			// modify 成功：订单 ID 可能变化，更新本地状态
+			if resp.OrderID != 0 {
+				s.currentTPOrderID = resp.OrderID
+			}
+			s.lastTPQty = newQty
+			s.lastTPPrice = tpPrice
+			s.mu.Unlock()
+			utils.Logger.Info("TP 已通过 Modify 更新",
+				zap.Int64("tp_id", resp.OrderID),
+				zap.Float64("qty", newQty),
+				zap.Float64("price", tpPrice))
+			return
+		}
+		// modify 失败（可能订单已成交/已取消/交易所拒绝），降级到 cancel+create
+		utils.Logger.Warn("Modify TP 失败，降级到 cancel+create",
+			zap.Int64("old_tp_id", oldTPID),
+			zap.Error(modErr))
+	}
+
+	// 降级路径：取消旧 TP + 创建新 TP
 	if oldTPID != 0 {
 		utils.Logger.Info("取消旧 TP", zap.Int64("id", oldTPID))
 		if err := s.exchange.CancelOrder(oldTPID); err != nil {
@@ -872,15 +1034,8 @@ func (s *MartingaleStrategy) updateTP() {
 		}
 	}
 
-	// 4. 放置新 TP
-	tpPrice = utils.RoundToSigFigs(tpPrice, 5, s.maxPriceDecimals)
-	tpQty := utils.ToFixed(math.Abs(pos.Size), s.quantityPrecision)
-
-	utils.Logger.Info("更新 TP",
-		zap.Float64("Price", tpPrice),
-		zap.Float64("Qty", tpQty))
-
-	resp, err := s.exchange.CreateOrder(exchange.OrderSideSell, exchange.OrderTypeLimit, tpQty, tpPrice)
+	// 放置新 TP
+	resp, err := s.exchange.CreateOrder(exchange.OrderSideSell, exchange.OrderTypeLimit, newQty, tpPrice)
 	if err != nil {
 		utils.Logger.Error("TP 订单下单失败", zap.Error(err))
 		return
@@ -901,7 +1056,14 @@ func (s *MartingaleStrategy) updateTP() {
 		return
 	}
 	s.currentTPOrderID = resp.OrderID
+	s.lastTPQty = newQty
+	s.lastTPPrice = tpPrice
 	s.mu.Unlock()
+
+	utils.Logger.Info("TP 已通过 Create 更新",
+		zap.Int64("tp_id", resp.OrderID),
+		zap.Float64("qty", newQty),
+		zap.Float64("price", tpPrice))
 }
 
 // ---------------------------------------------------------------------------

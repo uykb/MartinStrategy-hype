@@ -143,6 +143,11 @@ type ExchangeAdapter interface {
 	// CreateOrder 创建订单（市价 / 限价）
 	CreateOrder(side OrderSide, orderType OrderTypeKind, quantity, price float64) (*OrderResponse, error)
 
+	// ModifyOrder 修改已有订单的价格和数量（避免取消+重建的空窗期）。
+	// 返回的 OrderResponse.OrderID 通常与传入的 orderID 相同，
+	// 但交易所可能返回新 ID，调用方应使用返回值更新本地状态。
+	ModifyOrder(orderID int64, side OrderSide, orderType OrderTypeKind, quantity, price float64) (*OrderResponse, error)
+
 	// CancelOrder 取消指定订单
 	CancelOrder(orderID int64) error
 

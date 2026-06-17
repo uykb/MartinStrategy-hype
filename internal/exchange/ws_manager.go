@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -520,6 +521,7 @@ func (w *WSManager) reconnectWithBackoff() {
 // resyncViaREST 在 WebSocket 重连后，通过 REST API 强制查询持仓与挂单，
 // 校准 FSM 状态机，防止断线期间漏掉成交事件。
 // ★ P2 加固：对账前后发布冻结/解冻事件，让 FSM 在对账期间暂停处理。
+// ★ 修复：先解冻 FSM 再发布持仓/成交事件，避免事件被冻结检查丢弃。
 func (w *WSManager) resyncViaREST() {
 	utils.Logger.Info("开始 REST 对账 (Resync)...")
 
@@ -532,10 +534,13 @@ func (w *WSManager) resyncViaREST() {
 	// ★ P2 加固：发布对账开始事件，冻结 FSM
 	w.bus.Publish(core.EventResyncStart, nil)
 
-	// 确保对账结束后发布解冻事件
+	// 确保对账结束后发布解冻事件（panic 安全）
+	unfrozen := false
 	defer func() {
-		w.bus.Publish(core.EventResyncEnd, nil)
-		utils.Logger.Info("REST 对账完成，已发布解冻事件")
+		if !unfrozen {
+			w.bus.Publish(core.EventResyncEnd, nil)
+			utils.Logger.Info("REST 对账完成（defer 解冻）")
+		}
 	}()
 
 	// 1. 查询真实持仓
@@ -549,13 +554,10 @@ func (w *WSManager) resyncViaREST() {
 		utils.Logger.Info("REST 对账：检测到持仓",
 			zap.Float64("size", pos.Size),
 			zap.Float64("entry_price", pos.EntryPrice))
-
-		// 发布持仓更新事件，让 FSM 校准
-		w.bus.Publish(core.EventPositionUpdate, pos)
 	} else {
 		utils.Logger.Info("REST 对账：无持仓")
-		// 发布空持仓事件，确保 FSM 知道没有持仓
-		w.bus.Publish(core.EventPositionUpdate, &Position{Symbol: w.cfg.Symbol, Size: 0})
+		// 构造空持仓，稍后发布
+		pos = &Position{Symbol: w.cfg.Symbol, Size: 0}
 	}
 
 	// 2. 查询挂单列表
@@ -573,6 +575,7 @@ func (w *WSManager) resyncViaREST() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	var pendingFills []OrderUpdate
 	fills, err := w.adapter.infoClient.UserFills(ctx, w.adapter.userFillsParams())
 	if err != nil {
 		utils.Logger.Warn("REST 对账：查询最近成交失败", zap.Error(err))
@@ -581,13 +584,27 @@ func (w *WSManager) resyncViaREST() {
 			// 将断线期间可能漏掉的成交转换为 OrderUpdate 事件
 			update := fillToOrderUpdate(fill, w.cfg.Symbol)
 			if update != nil {
-				utils.Logger.Info("REST 对账：补发漏掉的成交事件",
-					zap.Int64("oid", update.OrderID),
-					zap.String("side", string(update.Side)),
-					zap.Float64("price", update.ExecPrice))
-				w.bus.Publish(core.EventOrderUpdate, update)
+				pendingFills = append(pendingFills, *update)
 			}
 		}
+	}
+
+	// ★ 先解冻 FSM，再发布事件，确保事件不被冻结检查丢弃
+	w.bus.Publish(core.EventResyncEnd, nil)
+	unfrozen = true
+	utils.Logger.Info("REST 对账：REST 查询完成，已解冻 FSM，开始发布校准事件")
+
+	// 发布持仓更新事件，让 FSM 校准（handlePositionUpdate 会触发 TP 校准）
+	w.bus.Publish(core.EventPositionUpdate, pos)
+
+	// 发布补漏的成交事件（FSM 已解冻，handleOrderUpdate 可正常处理）
+	for i := range pendingFills {
+		update := pendingFills[i]
+		utils.Logger.Info("REST 对账：补发漏掉的成交事件",
+			zap.Int64("oid", update.OrderID),
+			zap.String("side", string(update.Side)),
+			zap.Float64("price", update.ExecPrice))
+		w.bus.Publish(core.EventOrderUpdate, &update)
 	}
 }
 
@@ -866,7 +883,9 @@ func (w *WSManager) handleOrderUpdates(data json.RawMessage) {
 		update := &OrderUpdate{
 			OrderID: ou.Order.Oid,
 			Symbol:  ou.Order.Coin,
-			Status:  ou.Status,
+			// ★ 规范化状态为大写：orderUpdates 频道返回小写 "filled"/"canceled"，
+			// 但策略层检查 "FILLED"（大写），不转换会导致事件被静默忽略。
+			Status: strings.ToUpper(ou.Status),
 		}
 
 		// 转换方向：Hyperliquid "B"=Bid=Buy, "A"=Ask=Sell

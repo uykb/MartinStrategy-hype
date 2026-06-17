@@ -434,6 +434,96 @@ func (h *HyperliquidAdapter) CreateOrder(
 	return orderResp, nil
 }
 
+// ModifyOrder 修改已有订单的价格和数量（避免取消+重建的空窗期）。
+//
+// 适用场景：TP 单随仓位变化更新时，优先使用 modify 原子替换，
+// 避免先 cancel 再 create 期间仓位失去止盈保护。
+// 若 modify 失败（订单已成交/已取消/交易所拒绝），调用方应降级到 cancel+create。
+func (h *HyperliquidAdapter) ModifyOrder(
+	orderID int64,
+	side OrderSide,
+	orderType OrderTypeKind,
+	quantity, price float64,
+) (*OrderResponse, error) {
+	info := h.getSymbolInfo()
+
+	// 价格截断：Hyperliquid 严格要求 5 位有效数字
+	if info != nil && orderType == OrderTypeLimit {
+		price = utils.RoundToSigFigs(price, 5, info.MaxPriceDecimals)
+	}
+
+	// 数量精度截断
+	if info != nil {
+		quantity = utils.ToFixed(quantity, info.SzDecimals)
+	}
+
+	// 构建 SDK 修改请求
+	req := hyperliquid.CreateOrderRequest{
+		Coin:       h.cfg.Symbol,
+		IsBuy:      side == OrderSideBuy,
+		Size:       quantity,
+		Price:      price,
+		ReduceOnly: false,
+	}
+
+	switch orderType {
+	case OrderTypeLimit:
+		req.OrderType = hyperliquid.OrderType{
+			Limit: &hyperliquid.LimitOrderType{
+				Tif: hyperliquid.TifGtc,
+			},
+		}
+	case OrderTypeMarket:
+		req.OrderType = hyperliquid.OrderType{
+			Limit: &hyperliquid.LimitOrderType{
+				Tif: hyperliquid.TifIoc,
+			},
+		}
+		if side == OrderSideBuy {
+			req.Price = price * 1.05
+		} else {
+			req.Price = price * 0.95
+		}
+		if info != nil {
+			req.Price = utils.RoundToSigFigs(req.Price, 5, info.MaxPriceDecimals)
+		}
+	}
+
+	oid := orderID
+	modifyReq := hyperliquid.ModifyOrderRequest{
+		Oid:   &oid,
+		Order: req,
+	}
+
+	status, err := h.exchangeClient.ModifyOrder(h.ctx, modifyReq)
+	if err != nil {
+		return nil, fmt.Errorf("修改订单失败 (oid=%d): %w", orderID, err)
+	}
+
+	orderResp := &OrderResponse{Status: "unknown"}
+	if status.Resting != nil {
+		orderResp.OrderID = status.Resting.Oid
+		orderResp.Status = "resting"
+	} else if status.Filled != nil {
+		orderResp.OrderID = int64(status.Filled.Oid)
+		orderResp.Status = "filled"
+	} else if status.Error != nil {
+		orderResp.Status = "error"
+		return orderResp, fmt.Errorf("修改订单被交易所拒绝: %s", *status.Error)
+	}
+
+	utils.Logger.Info("订单已修改",
+		zap.Int64("orig_oid", orderID),
+		zap.Int64("new_oid", orderResp.OrderID),
+		zap.String("side", string(side)),
+		zap.String("type", string(orderType)),
+		zap.Float64("price", price),
+		zap.Float64("quantity", quantity),
+		zap.String("status", orderResp.Status))
+
+	return orderResp, nil
+}
+
 // CancelOrder 取消指定订单
 func (h *HyperliquidAdapter) CancelOrder(orderID int64) error {
 	_, err := h.exchangeClient.Cancel(h.ctx, h.cfg.Symbol, orderID)
