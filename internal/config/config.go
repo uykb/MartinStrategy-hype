@@ -85,6 +85,9 @@ func LoadConfig(path string) (*Config, error) {
 	// 环境变量覆盖（前缀 MARTIN_，如 MARTIN_EXCHANGE_API_KEY）
 	viper.SetEnvPrefix("MARTIN")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	// ★ 关键：必须用 BindEnv 显式绑定，AutomaticEnv() 在 Unmarshal 时不生效
+	viper.BindEnv("exchange.api_key")
+	viper.BindEnv("exchange.api_secret")
 	viper.AutomaticEnv()
 
 	// config.yaml 可选：不存在时不报错，纯靠环境变量 + 默认值
