@@ -9,7 +9,7 @@ RUN go mod download
 COPY . .
 
 # Build (pure Go, no CGO needed)
-RUN CGO_ENABLED=0 GOOS=linux go build -o bot cmd/bot/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o bot ./cmd/bot/
 
 # Runtime Stage
 FROM alpine:3.18
