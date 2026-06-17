@@ -19,6 +19,11 @@ WORKDIR /app
 RUN apk --no-cache add ca-certificates
 
 COPY --from=builder /app/bot .
-COPY config.yaml .
+COPY --from=builder /app/config.yaml.example ./config.yaml.example
+
+# config.yaml 通过 docker-compose volume 挂载，不打包进镜像
+# 首次部署：cp config.yaml.example config.yaml && 编辑填入密钥
+
+EXPOSE 8080
 
 CMD ["./bot"]

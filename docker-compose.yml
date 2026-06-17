@@ -5,7 +5,10 @@ services:
       dockerfile: Dockerfile
     container_name: martinstrategy
     restart: unless-stopped
+    ports:
+      - "8080:8080"
     volumes:
+      # ⚠️ 首次部署：cp config.yaml.example config.yaml && 编辑填入密钥
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
     environment:
