@@ -77,7 +77,7 @@ func LoadConfig(path string) (*Config, error) {
 	viper.SetDefault("strategy.atr_period", 14)
 	viper.SetDefault("strategy.base_ratio", 0.05)
 	viper.SetDefault("storage.sqlite_path", "data/bot.db")
-	viper.SetDefault("storage.redis_addr", "localhost:6379")
+	viper.SetDefault("storage.redis_addr", "")     // 空字符串 = 不启用 Redis
 	viper.SetDefault("storage.redis_db", 0)
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("health.addr", ":8080")

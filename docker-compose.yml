@@ -7,12 +7,10 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    env_file:
+      - .env  # 包含 MARTIN_EXCHANGE_API_KEY + MARTIN_EXCHANGE_API_SECRET（不提交到 git）
     environment:
-      # ★ 必填：Agent 钱包私钥（十六进制，不含 0x 前缀）
-      - MARTIN_EXCHANGE_API_KEY=${MARTIN_EXCHANGE_API_KEY}
-      # ★ 必填：主钱包地址（十六进制，含 0x 前缀）
-      - MARTIN_EXCHANGE_API_SECRET=${MARTIN_EXCHANGE_API_SECRET}
-      # 可选配置（以下为默认值）
+      # 可选配置（以下为默认值，可通过 .env 覆盖）
       - MARTIN_EXCHANGE_SYMBOL=HYPE
       - MARTIN_EXCHANGE_USE_TESTNET=false
       - MARTIN_STRATEGY_MAX_SAFETY_ORDERS=9

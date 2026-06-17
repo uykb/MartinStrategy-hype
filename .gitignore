@@ -22,6 +22,7 @@ Thumbs.db
 config.yaml
 *.env
 .env
+!.env.example
 
 # Go
 vendor/

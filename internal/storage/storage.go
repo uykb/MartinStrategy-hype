@@ -62,28 +62,33 @@ func InitStorage(sqlitePath, redisAddr, redisPass string, redisDB int) (*Databas
 		return nil, err
 	}
 
-	// Initialize Redis（可选：连接失败不阻断启动）
-	rdb := redis.NewClient(&redis.Options{
-		Addr:            redisAddr,
-		Password:        redisPass,
-		DB:               redisDB,
-		MaxRetries:      1,  // 仅重试 1 次，避免刷屏
-		PoolSize:        3,
-		MinIdleConns:    1,
-		ConnMaxIdleTime: 30 * time.Second,
-	})
+	// Initialize Redis（可选：仅当 redisAddr 非空时启用，不阻断启动）
+	var rdb *redis.Client
+	if redisAddr != "" {
+		rdb = redis.NewClient(&redis.Options{
+			Addr:            redisAddr,
+			Password:        redisPass,
+			DB:               redisDB,
+			MaxRetries:      1,
+			PoolSize:        3,
+			MinIdleConns:    1,
+			ConnMaxIdleTime: 30 * time.Second,
+		})
 
-	// 测试 Redis 连接，失败时仅警告，不阻断启动
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if _, err := rdb.Ping(ctx).Result(); err != nil {
-		utils.Logger.Warn("Redis 连接失败，分布式锁功能不可用（单实例部署可忽略）",
-			zap.String("addr", redisAddr),
-			zap.Error(err))
-		rdb.Close() // 关闭无效连接，停止后台重试
-		rdb = nil    // 标记为不可用
+		// 测试连接，失败时关闭客户端并置空
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if _, err := rdb.Ping(ctx).Result(); err != nil {
+			utils.Logger.Warn("Redis 连接失败，分布式锁功能不可用（单实例部署可忽略）",
+				zap.String("addr", redisAddr),
+				zap.Error(err))
+			rdb.Close()
+			rdb = nil
+		} else {
+			utils.Logger.Info("Redis 连接成功", zap.String("addr", redisAddr))
+		}
 	} else {
-		utils.Logger.Info("Redis 连接成功", zap.String("addr", redisAddr))
+		utils.Logger.Info("未配置 Redis，分布式锁功能禁用（单实例部署正常）")
 	}
 
 	return &Database{
