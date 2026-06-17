@@ -327,11 +327,23 @@ func (h *HyperliquidAdapter) GetBalance() (float64, error) {
 		return 0, fmt.Errorf("获取用户状态失败: %w", err)
 	}
 
-	// Hyperliquid 使用 USDC 作为保证金
-	// AccountValue 包含未实现盈亏的总账户价值
-	accountValue, _ := strconv.ParseFloat(userState.MarginSummary.AccountValue, 64)
+	// 余额可能分布在多个字段，取最大值
+	var balance float64
+	marginVal, _ := strconv.ParseFloat(userState.MarginSummary.AccountValue, 64)
+	crossVal, _ := strconv.ParseFloat(userState.CrossMarginSummary.AccountValue, 64)
+	withdrawable, _ := strconv.ParseFloat(userState.Withdrawable, 64)
 
-	return accountValue, nil
+	balance = marginVal
+	if crossVal > balance { balance = crossVal }
+	if withdrawable > balance { balance = withdrawable }
+
+	utils.Logger.Info("余额查询",
+		zap.Float64("marginSummary", marginVal),
+		zap.Float64("crossMargin", crossVal),
+		zap.Float64("withdrawable", withdrawable),
+		zap.Float64("used", balance))
+
+	return balance, nil
 }
 
 // CreateOrder 创建订单
