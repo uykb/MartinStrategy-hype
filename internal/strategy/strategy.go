@@ -305,6 +305,7 @@ func (s *MartingaleStrategy) syncState() {
 		} else {
 			hasTP := false
 			gridCount := 0
+			var liveTPQty float64 // 交易所端 TP 的实际委托数量
 			for _, o := range orders {
 				if o.Side == exchange.OrderSideBuy {
 					gridCount++
@@ -312,7 +313,10 @@ func (s *MartingaleStrategy) syncState() {
 				if o.Side == exchange.OrderSideSell && o.Type == exchange.OrderTypeLimit {
 					hasTP = true
 					s.currentTPOrderID = o.OrderID
-					utils.Logger.Info("发现已有 TP 订单", zap.Int64("id", o.OrderID))
+					liveTPQty = o.Quantity
+					utils.Logger.Info("发现已有 TP 订单",
+						zap.Int64("id", o.OrderID),
+						zap.Float64("live_qty", o.Quantity))
 				}
 			}
 
@@ -333,11 +337,15 @@ func (s *MartingaleStrategy) syncState() {
 					s.safeUpdateTP()
 				}()
 			} else {
-				// ★ 审计修复：TP 存在时，初始化 lastTPQty 为当前持仓量（Floor 截断）。
-				s.lastTPQty = utils.FloorToDecimals(math.Abs(pos.Size), s.quantityPrecision)
+				// ★ 修复：lastTPQty 初始化为交易所端 TP 的实际委托数量（Floor 截断），
+				// 而非当前持仓量。这样若 TP 与持仓不一致（如历史浮点 bug 遗留 2.52 vs 2.53），
+				// 下次 updateTP 的仓位变化检测能识别差异并触发 modify 自愈修正。
+				// 原实现用持仓量初始化会让本地误认为 TP 已对齐，跳过更新，不一致无法自愈。
+				s.lastTPQty = utils.FloorToDecimals(liveTPQty, s.quantityPrecision)
 				utils.Logger.Info("状态已恢复，TP 订单存在",
 					zap.Int("open_orders", len(orders)),
 					zap.Int("grid_orders", gridCount),
+					zap.Float64("live_tp_qty", liveTPQty),
 					zap.Float64("initialized_lastTPQty", s.lastTPQty))
 				s.mu.Unlock()
 			}
