@@ -604,10 +604,18 @@ func (s *MartingaleStrategy) handleResyncStart(ctx context.Context, event core.E
 	return nil
 }
 
-// handleResyncEnd 处理对账结束事件：解冻 FSM，恢复正常处理
+// handleResyncEnd 处理对账结束事件：延迟解冻 FSM，恢复正常处理。
+//
+// WS 重连/重订阅后会立即推送历史订单状态，直接在 handleResyncEnd 中解冻
+// 会导致这些历史事件被正常处理（如历史 SELL 重置 IDLE + 撤销网格）。
+// 延迟 2 秒解冻给 WS 时间排空历史事件。
 func (s *MartingaleStrategy) handleResyncEnd(ctx context.Context, event core.Event) error {
-	s.frozen.Store(false)
-	utils.Logger.Info("FSM 已解冻：REST 对账完成，恢复 tick 和订单处理")
+	// 延迟解冻：WS 重连后 2 秒内推送的多是历史事件，不应处理
+	go func() {
+		time.Sleep(2 * time.Second)
+		s.frozen.Store(false)
+		utils.Logger.Info("FSM 已解冻：REST 对账完成，恢复 tick 和订单处理")
+	}()
 	return nil
 }
 
