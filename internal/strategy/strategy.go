@@ -269,11 +269,11 @@ func (s *MartingaleStrategy) initSymbolInfo() error {
 // syncState 初始化时同步 FSM 状态
 func (s *MartingaleStrategy) syncState() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	pos, err := s.exchange.GetPosition()
 	if err != nil {
 		utils.Logger.Error("同步持仓状态失败", zap.Error(err))
+		s.mu.Unlock()
 		return
 	}
 	s.position = pos
@@ -289,6 +289,7 @@ func (s *MartingaleStrategy) syncState() {
 		orders, err := s.exchange.GetOpenOrders()
 		if err != nil {
 			utils.Logger.Error("获取挂单列表失败", zap.Error(err))
+			s.mu.Unlock()
 		} else {
 			// ★ 修复：验证网格订单完整性
 			gridCount := 0
@@ -305,11 +306,13 @@ func (s *MartingaleStrategy) syncState() {
 			}
 
 			// ★ 修复：如果网格订单不完整，设置 gridPlaced=false 允许重新放置
+			needGridRebuild := false
 			if gridCount < s.cfg.MaxSafetyOrders {
-				utils.Logger.Warn("网格订单不完整，允许重新放置",
+				utils.Logger.Warn("网格订单不完整，将重新放置",
 					zap.Int("existing_grid_count", gridCount),
 					zap.Int("expected", s.cfg.MaxSafetyOrders))
 				s.gridPlaced = false
+				needGridRebuild = true
 			} else {
 				utils.Logger.Info("网格订单完整",
 					zap.Int("grid_count", gridCount))
@@ -317,6 +320,8 @@ func (s *MartingaleStrategy) syncState() {
 
 			if !hasTP {
 				utils.Logger.Warn("检测到持仓但无 TP 订单，正在恢复 TP...")
+				// 先释放锁，再启动 goroutine（safeUpdateTP 需要 mu.RLock）
+				s.mu.Unlock()
 				go func() {
 					defer func() {
 						if r := recover(); r != nil {
@@ -328,13 +333,27 @@ func (s *MartingaleStrategy) syncState() {
 				}()
 			} else {
 				// ★ 审计修复：TP 存在时，初始化 lastTPQty 为当前持仓量（Floor 截断）。
-				// 重启后 lastTPQty=0，如果 resyncViaREST 触发 safeUpdateTP，
-				// updateTP 会误判为"仓位变化"而取消现有 TP 再重建（浪费 API + 空窗期）。
-				// 通过预设 lastTPQty，让 updateTP 的仓位变化检测正确跳过。
 				s.lastTPQty = utils.FloorToDecimals(math.Abs(pos.Size), s.quantityPrecision)
 				utils.Logger.Info("状态已恢复，TP 订单存在",
 					zap.Int("open_orders", len(orders)),
 					zap.Float64("initialized_lastTPQty", s.lastTPQty))
+				// 先释放锁，再启动 goroutine
+				s.mu.Unlock()
+			}
+
+			// ★ 修复：网格不完整时，启动 goroutine 重新放置网格。
+			// 必须在 mu.Unlock() 之后调用，因为 placeGridOrders 需要 mu.RLock。
+			if needGridRebuild {
+				utils.Logger.Info("启动网格重新放置...")
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							utils.Logger.Error("syncState placeGridOrders goroutine panic", zap.Any("recover", r))
+						}
+					}()
+					time.Sleep(200 * time.Millisecond)
+					s.safePlaceGridOrders()
+				}()
 			}
 		}
 	} else {
@@ -345,6 +364,7 @@ func (s *MartingaleStrategy) syncState() {
 		s.lastTPPrice = 0
 		s.position = nil
 		s.activeOrders = make(map[int64]*exchange.OpenOrder)
+		s.mu.Unlock()
 		utils.Logger.Info("状态同步：无持仓", zap.String("state", string(s.currentState)))
 	}
 }
