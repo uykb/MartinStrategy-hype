@@ -769,13 +769,6 @@ func (h *HyperliquidAdapter) restPriceFallback() {
 	}
 }
 
-// userFillsParams 构建 SDK 的 UserFillsParams 请求参数
-func (h *HyperliquidAdapter) userFillsParams() hyperliquid.UserFillsParams {
-	return hyperliquid.UserFillsParams{
-		Address: h.cfg.AccountAddress,
-	}
-}
-
 // ---------------------------------------------------------------------------
 // 辅助函数
 // ---------------------------------------------------------------------------

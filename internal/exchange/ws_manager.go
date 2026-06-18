@@ -12,14 +12,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-	hyperliquid "github.com/sonirico/go-hyperliquid"
 	"github.com/uykb/MartinStrategy/internal/core"
 	"github.com/uykb/MartinStrategy/internal/utils"
 	"go.uber.org/zap"
@@ -585,39 +583,6 @@ func (w *WSManager) resyncViaREST() {
 
 	// 发布持仓更新事件，让 FSM 校准（handlePositionUpdate 会触发 TP 校准）
 	w.bus.Publish(core.EventPositionUpdate, pos)
-}
-
-// fillToOrderUpdate 将 Hyperliquid Fill 转换为通用 OrderUpdate
-func fillToOrderUpdate(fill hyperliquid.Fill, symbol string) *OrderUpdate {
-	// 过滤非目标交易对
-	if fill.Coin != symbol {
-		return nil
-	}
-
-	update := &OrderUpdate{
-		OrderID:   fill.Oid,
-		Symbol:    fill.Coin,
-		ExecPrice: 0,
-		Quantity:  0,
-		Status:    "FILLED",
-	}
-
-	// 解析价格和数量
-	if px, err := strconv.ParseFloat(fill.Price, 64); err == nil {
-		update.ExecPrice = px
-	}
-	if sz, err := strconv.ParseFloat(fill.Size, 64); err == nil {
-		update.Quantity = sz
-	}
-
-	// 转换方向：Hyperliquid "B"=Bid=Buy, "A"=Ask=Sell
-	if fill.Side == "B" {
-		update.Side = OrderSideBuy
-	} else { // "A"
-		update.Side = OrderSideSell
-	}
-
-	return update
 }
 
 // ---------------------------------------------------------------------------
