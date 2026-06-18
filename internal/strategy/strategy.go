@@ -284,14 +284,29 @@ func (s *MartingaleStrategy) syncState() {
 		if err != nil {
 			utils.Logger.Error("获取挂单列表失败", zap.Error(err))
 		} else {
+			// ★ 修复：验证网格订单完整性
+			gridCount := 0
 			hasTP := false
 			for _, o := range orders {
+				if o.Side == exchange.OrderSideBuy {
+					gridCount++
+				}
 				if o.Side == exchange.OrderSideSell && o.Type == exchange.OrderTypeLimit {
 					hasTP = true
 					s.currentTPOrderID = o.OrderID
 					utils.Logger.Info("发现已有 TP 订单", zap.Int64("id", o.OrderID))
-					break
 				}
+			}
+
+			// ★ 修复：如果网格订单不完整，设置 gridPlaced=false 允许重新放置
+			if gridCount < s.cfg.MaxSafetyOrders {
+				utils.Logger.Warn("网格订单不完整，允许重新放置",
+					zap.Int("existing_grid_count", gridCount),
+					zap.Int("expected", s.cfg.MaxSafetyOrders))
+				s.gridPlaced = false
+			} else {
+				utils.Logger.Info("网格订单完整",
+					zap.Int("grid_count", gridCount))
 			}
 
 			if !hasTP {
@@ -306,7 +321,14 @@ func (s *MartingaleStrategy) syncState() {
 					s.safeUpdateTP()
 				}()
 			} else {
-				utils.Logger.Info("状态已恢复，TP 订单存在", zap.Int("open_orders", len(orders)))
+				// ★ 审计修复：TP 存在时，初始化 lastTPQty 为当前持仓量（Floor 截断）。
+				// 重启后 lastTPQty=0，如果 resyncViaREST 触发 safeUpdateTP，
+				// updateTP 会误判为"仓位变化"而取消现有 TP 再重建（浪费 API + 空窗期）。
+				// 通过预设 lastTPQty，让 updateTP 的仓位变化检测正确跳过。
+				s.lastTPQty = utils.FloorToDecimals(math.Abs(pos.Size), s.quantityPrecision)
+				utils.Logger.Info("状态已恢复，TP 订单存在",
+					zap.Int("open_orders", len(orders)),
+					zap.Float64("initialized_lastTPQty", s.lastTPQty))
 			}
 		}
 	} else {
@@ -450,7 +472,7 @@ func (s *MartingaleStrategy) waitForFillAndPlaceGrid() {
 				utils.Logger.Info("检测到持仓，开始放置网格订单",
 					zap.Float64("size", pos.Size),
 					zap.Float64("entry_price", pos.EntryPrice))
-				s.placeGridOrders(pos.EntryPrice)
+				s.placeGridOrders()
 				return
 			}
 		}
@@ -509,7 +531,7 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 					s.mu.Lock()
 					s.currentState = StateInPosition
 					s.mu.Unlock()
-					go s.safePlaceGridOrders(order.ExecPrice)
+					go s.safePlaceGridOrders()
 				} else {
 					utils.Logger.Info("基础订单成交但网格已放置，更新 TP", zap.Float64("execPrice", order.ExecPrice))
 					s.mu.Lock()
@@ -518,6 +540,10 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 					go s.safeUpdateTP()
 				}
 			} else {
+				// ★ 审计修复：安全订单（加仓单）成交时，始终更新 TP。
+				// gridPlaced 仅控制是否重新放置网格订单，不应阻止 TP 更新。
+				// 原逻辑在 gridPlaced=false 时跳过 TP，会导致重启后不完整网格的
+				// 加仓成交不更新 TP，造成 TP 数量与实际持仓不一致（残余尾仓）。
 				utils.Logger.Info("安全订单成交，重新计算 TP", zap.Float64("execPrice", order.ExecPrice))
 				go s.safeUpdateTP()
 			}
@@ -616,27 +642,41 @@ func (s *MartingaleStrategy) handlePositionUpdate(ctx context.Context, event cor
 // ★ P0 加固：带 panic 恢复的安全包装函数
 // ---------------------------------------------------------------------------
 
-// safePlaceGridOrders 是 placeGridOrders 的安全包装，带 panic 恢复和自愈
-func (s *MartingaleStrategy) safePlaceGridOrders(execPrice float64) {
+// safePlaceGridOrders 是 placeGridOrders 的安全包装，带 panic 恢复和自愈。
+// ★ 修复：移除 execPrice 参数（placeGridOrders 始终使用 GetPosition().EntryPrice）。
+// ★ 修复：添加最大重试次数，防止 panic 恢复导致无限自愈循环。
+func (s *MartingaleStrategy) safePlaceGridOrders() {
+	const maxRetries = 3
+	s.placeGridOrdersWithRetry(0, maxRetries)
+}
+
+// placeGridOrdersWithRetry 带重试计数的内部实现。
+func (s *MartingaleStrategy) placeGridOrdersWithRetry(attempt, maxRetries int) {
 	defer func() {
 		if r := recover(); r != nil {
 			utils.Logger.Error("placeGridOrders panic 恢复",
 				zap.Any("recover", r),
+				zap.Int("attempt", attempt+1),
 				zap.Stack("stack"))
-			// 自愈：5 秒后重试
-			go func() {
-				time.Sleep(5 * time.Second)
-				s.mu.RLock()
-				state := s.currentState
-				gridPlaced := s.gridPlaced
-				s.mu.RUnlock()
-				if state == StateInPosition && !gridPlaced {
-					s.safePlaceGridOrders(execPrice)
-				}
-			}()
+			// 自愈：5 秒后重试（有最大次数限制）
+			if attempt+1 < maxRetries {
+				go func() {
+					time.Sleep(5 * time.Second)
+					s.mu.RLock()
+					state := s.currentState
+					gridPlaced := s.gridPlaced
+					s.mu.RUnlock()
+					if state == StateInPosition && !gridPlaced {
+						s.placeGridOrdersWithRetry(attempt+1, maxRetries)
+					}
+				}()
+			} else {
+				utils.Logger.Error("placeGridOrders 已达最大重试次数，放弃",
+					zap.Int("max_retries", maxRetries))
+			}
 		}
 	}()
-	s.placeGridOrders(execPrice)
+	s.placeGridOrders()
 }
 
 // safeUpdateTP 是 updateTP 的安全包装，带 panic 恢复、自愈和并发脏标志。
@@ -645,8 +685,7 @@ func (s *MartingaleStrategy) safePlaceGridOrders(execPrice float64) {
 //   - 使用 TryLock 避免多个 goroutine 阻塞等待
 //   - 若 TryLock 失败（已有 updateTP 在执行），标记 tpDirty=true 并返回
 //   - 当前 updateTP 完成后检查 tpDirty，若为 true 则重跑，确保 TP 始终与仓位一致
-//
-// 这解决了原来并发成交时 updateTP 被静默跳过导致 TP 数量过期的问题。
+//   - ★ 修复：dirty 循环最多重跑 3 次，防止高频成交场景下 goroutine 永不退出（liveness bug）
 func (s *MartingaleStrategy) safeUpdateTP() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -683,11 +722,22 @@ func (s *MartingaleStrategy) safeUpdateTP() {
 	s.tpDirty.Store(false)
 	s.updateTP()
 
-	// 若执行期间有新的 updateTP 请求被跳过（dirty=true），重跑
-	for s.tpDirty.Load() {
+	// ★ 修复：dirty 循环最多重跑 maxTPDirtyRetries 次，防止高频成交场景下 goroutine 永不退出。
+	// 原实现无上限：若 safeUpdateTP 调用频率高于 updateTP 执行速度，持有锁的 goroutine
+	// 会因 tpDirty 持续为 true 而永远不退出，导致后续所有 TryLock 失败、tpSkipCount 飙升。
+	const maxTPDirtyRetries = 3
+	for i := 0; i < maxTPDirtyRetries && s.tpDirty.Load(); i++ {
 		s.tpDirty.Store(false)
-		utils.Logger.Info("检测到 dirty 标志，重跑 updateTP")
+		utils.Logger.Info("检测到 dirty 标志，重跑 updateTP",
+			zap.Int("retry", i+1),
+			zap.Int("max_retries", maxTPDirtyRetries))
 		s.updateTP()
+	}
+
+	// 如果重跑后仍有 dirty（高频场景），留给下一次 safeUpdateTP 调用处理
+	if s.tpDirty.Load() {
+		utils.Logger.Warn("dirty 标志在重跑后仍存在，留给下次调用处理",
+			zap.Int("completed_retries", maxTPDirtyRetries))
 	}
 }
 
@@ -701,14 +751,16 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 
 	minNotional := s.calcMinNotional()
 	unitQtyRaw := minNotional / currentPrice
-	unitQty := utils.RoundUpToTickSize(unitQtyRaw, s.stepSize)
+	// ★ 审计修复：数量使用 Floor 截断，防止向上取整导致余额不足
+	unitQty := utils.FloorToTickSize(unitQtyRaw, s.stepSize)
 
 	if unitQty < s.minQty {
 		unitQty = s.minQty
 	}
 
 	baseQty := unitQty * 1.0
-	baseQty = utils.ToFixed(baseQty, s.quantityPrecision)
+	// ★ 审计修复：数量使用 FloorToDecimals 向下取整，杜绝四舍五入
+	baseQty = utils.FloorToDecimals(baseQty, s.quantityPrecision)
 
 	utils.Logger.Info("计算基础下单量",
 		zap.Float64("price", currentPrice),
@@ -725,9 +777,13 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 	return nil
 }
 
-// placeGridOrders 放置网格安全订单
-func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
-	utils.Logger.Info("placeGridOrders 开始", zap.Float64("execPrice", execPrice))
+// placeGridOrders 放置网格安全订单。
+// ★ 修复：始终使用 GetPosition().EntryPrice 作为入场价，不依赖订单事件的 execPrice
+// （execPrice 可能因手续费/滑点与链上均价不一致）。
+// ★ 修复：检测不完整网格时先取消旧单再重新放置，防止重复挂单。
+// ★ 修复：仅在所有订单成功下单后才设置 gridPlaced=true。
+func (s *MartingaleStrategy) placeGridOrders() {
+	utils.Logger.Info("placeGridOrders 开始")
 
 	// 检查网格是否已放置，防止重复
 	s.mu.RLock()
@@ -738,7 +794,7 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 	}
 	s.mu.RUnlock()
 
-	// 检查是否已有活跃的网格订单（防止重启后重复放置）
+	// ★ 修复：检查是否已有活跃的网格订单，验证完整性
 	existingOrders, err := s.exchange.GetOpenOrders()
 	if err == nil && len(existingOrders) > 0 {
 		gridCount := 0
@@ -747,14 +803,31 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 				gridCount++
 			}
 		}
-		if gridCount > 0 {
-			utils.Logger.Warn("placeGridOrders 跳过：发现已有网格订单",
+		if gridCount >= s.cfg.MaxSafetyOrders {
+			utils.Logger.Info("placeGridOrders 跳过：网格订单完整",
 				zap.Int("existing_grid_count", gridCount),
-				zap.Int("total_orders", len(existingOrders)))
+				zap.Int("expected", s.cfg.MaxSafetyOrders))
 			s.mu.Lock()
 			s.gridPlaced = true
 			s.mu.Unlock()
 			return
+		}
+		// ★ 修复：网格不完整，取消现有买单后重新放置
+		if gridCount > 0 {
+			utils.Logger.Warn("发现不完整网格，取消现有买单后重新放置",
+				zap.Int("existing_grid_count", gridCount),
+				zap.Int("expected", s.cfg.MaxSafetyOrders))
+			for _, o := range existingOrders {
+				if o.Side == exchange.OrderSideBuy {
+					if cancelErr := s.exchange.CancelOrder(o.OrderID); cancelErr != nil {
+						utils.Logger.Warn("取消不完整网格订单失败",
+							zap.Int64("order_id", o.OrderID),
+							zap.Error(cancelErr))
+					}
+				}
+			}
+			// 短暂等待交易所处理取消
+			time.Sleep(200 * time.Millisecond)
 		}
 	}
 
@@ -779,20 +852,15 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 	}
 	s.mu.RUnlock()
 
-	var entryPrice float64
-
-	if execPrice > 0 {
-		entryPrice = execPrice
-		utils.Logger.Info("使用订单事件中的成交价", zap.Float64("entryPrice", entryPrice))
-	} else {
-		pos, err := s.exchange.GetPosition()
-		if err != nil {
-			utils.Logger.Error("获取持仓信息失败", zap.Error(err))
-			return
-		}
-		entryPrice = pos.EntryPrice
-		utils.Logger.Info("使用持仓 API 中的入场价", zap.Float64("entryPrice", entryPrice))
+	// ★ 修复：始终通过 REST API 获取链上真实持仓均价，不使用订单事件的 execPrice。
+	// execPrice 来自 WebSocket 成交事件，可能因手续费、滑点或部分成交与链上均价不一致。
+	pos, err := s.exchange.GetPosition()
+	if err != nil {
+		utils.Logger.Error("获取持仓信息失败", zap.Error(err))
+		return
 	}
+	entryPrice := pos.EntryPrice
+	utils.Logger.Info("使用持仓 API 中的入场价", zap.Float64("entryPrice", entryPrice))
 
 	if entryPrice <= 0 {
 		utils.Logger.Error("无效的入场价，无法放置网格订单", zap.Float64("entryPrice", entryPrice))
@@ -810,18 +878,37 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 	atr1w := s.fetchATR("1w")
 	atr1M := s.fetchATR("1M")
 
-	if atr1h == 0 { atr1h = entryPrice * 0.01 }
-	if atr2h == 0 { atr2h = entryPrice * 0.01 }
-	if atr4h == 0 { atr4h = entryPrice * 0.01 }
-	if atr8h == 0 { atr8h = entryPrice * 0.01 }
-	if atr12h == 0 { atr12h = entryPrice * 0.01 }
-	if atr1d == 0 { atr1d = entryPrice * 0.01 }
-	if atr3d == 0 { atr3d = entryPrice * 0.01 }
-	if atr1w == 0 { atr1w = entryPrice * 0.01 }
-	if atr1M == 0 { atr1M = entryPrice * 0.01 }
+	if atr1h == 0 {
+		atr1h = entryPrice * 0.01
+	}
+	if atr2h == 0 {
+		atr2h = entryPrice * 0.01
+	}
+	if atr4h == 0 {
+		atr4h = entryPrice * 0.01
+	}
+	if atr8h == 0 {
+		atr8h = entryPrice * 0.01
+	}
+	if atr12h == 0 {
+		atr12h = entryPrice * 0.01
+	}
+	if atr1d == 0 {
+		atr1d = entryPrice * 0.01
+	}
+	if atr3d == 0 {
+		atr3d = entryPrice * 0.01
+	}
+	if atr1w == 0 {
+		atr1w = entryPrice * 0.01
+	}
+	if atr1M == 0 {
+		atr1M = entryPrice * 0.01
+	}
 
 	minNotional := s.calcMinNotional()
-	unitQty := utils.RoundUpToTickSize(minNotional/entryPrice, s.stepSize)
+	// ★ 审计修复：数量使用 FloorToTickSize 向下取整
+	unitQty := utils.FloorToTickSize(minNotional/entryPrice, s.stepSize)
 
 	utils.Logger.Info("放置网格订单",
 		zap.Float64("Entry", entryPrice),
@@ -831,6 +918,9 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 	gridDistances := []float64{atr1h, atr2h, atr4h, atr8h, atr12h, atr1d, atr3d, atr1w, atr1M}
 
 	currentPriceLevel := entryPrice
+
+	// ★ 修复：追踪成功下单数量，仅在全部成功时设置 gridPlaced=true
+	successCount := 0
 
 	for i := 1; i <= s.cfg.MaxSafetyOrders; i++ {
 		stepDist := 0.0
@@ -858,8 +948,9 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 			qty = minNotional / price
 		}
 
-		qty = utils.RoundUpToTickSize(qty, s.stepSize)
-		qty = utils.ToFixed(qty, s.quantityPrecision)
+		// ★ 审计修复：数量严格向下取整，防止余额不足和幽灵尾仓
+		qty = utils.FloorToTickSize(qty, s.stepSize)
+		qty = utils.FloorToDecimals(qty, s.quantityPrecision)
 
 		utils.Logger.Info("放置安全订单",
 			zap.Int("index", i),
@@ -869,30 +960,41 @@ func (s *MartingaleStrategy) placeGridOrders(execPrice float64) {
 		)
 
 		// ★ P1 加固：带重试的下单逻辑（3次重试 + 抖动退避）
-		s.placeOrderWithRetry(exchange.OrderSideBuy, exchange.OrderTypeLimit, qty, price, i)
+		if s.placeOrderWithRetry(exchange.OrderSideBuy, exchange.OrderTypeLimit, qty, price, i) {
+			successCount++
+		}
 
 		// 避免 API 限流
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// 放置初始 TP
-	s.safeUpdateTP()
-
-	// 标记网格已放置
+	// ★ 修复：仅在所有订单成功下单后才标记网格已放置
 	s.mu.Lock()
-	s.gridPlaced = true
+	if successCount == s.cfg.MaxSafetyOrders {
+		s.gridPlaced = true
+		utils.Logger.Info("网格订单放置完成，gridPlaced=true",
+			zap.Int("success_count", successCount))
+	} else {
+		s.gridPlaced = false
+		utils.Logger.Warn("网格订单放置不完整，允许重试",
+			zap.Int("success_count", successCount),
+			zap.Int("expected", s.cfg.MaxSafetyOrders))
+	}
 	s.mu.Unlock()
-	utils.Logger.Info("网格订单放置完成，gridPlaced=true")
+
+	// ★ 修复：在 gridPlaced 状态确定后，再更新 TP（防止 TP 在网格未完成时触发）
+	s.safeUpdateTP()
 }
 
-// placeOrderWithRetry 带重试的下单逻辑（3次重试 + 抖动指数退避）
-func (s *MartingaleStrategy) placeOrderWithRetry(side exchange.OrderSide, orderType exchange.OrderTypeKind, qty, price float64, level int) {
+// placeOrderWithRetry 带重试的下单逻辑（3次重试 + 抖动指数退避）。
+// ★ 修复：返回 bool 表示是否成功，供 placeGridOrders 追踪网格完整性。
+func (s *MartingaleStrategy) placeOrderWithRetry(side exchange.OrderSide, orderType exchange.OrderTypeKind, qty, price float64, level int) bool {
 	const maxRetries = 3
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		_, err := s.exchange.CreateOrder(side, orderType, qty, price)
 		if err == nil {
-			return // 成功
+			return true // 成功
 		}
 
 		if attempt < maxRetries-1 {
@@ -912,6 +1014,7 @@ func (s *MartingaleStrategy) placeOrderWithRetry(side exchange.OrderSide, orderT
 				zap.Error(err))
 		}
 	}
+	return false // 全部重试失败
 }
 
 // updateTP 更新止盈订单
@@ -957,8 +1060,9 @@ func (s *MartingaleStrategy) updateTP() {
 		return
 	}
 
-	// 精度截断后的当前仓位数量（与实际下单精度一致，避免浮点误差误判）
-	newQty := utils.ToFixed(math.Abs(pos.Size), s.quantityPrecision)
+	// ★ 审计修复：TP 数量使用 FloorToDecimals 向下取整，与实际持仓精度对齐。
+	// 确保 tp_qty ≤ 实际持仓量，平仓后不会产生反向微型尾仓。
+	newQty := utils.FloorToDecimals(math.Abs(pos.Size), s.quantityPrecision)
 
 	// ★ 仓位变化检测：如果仓位未变且已有 TP 订单，跳过更新
 	// 此时不获取 ATR、不修改 TP 价格，符合"仓位未变不更新止盈位置"的需求

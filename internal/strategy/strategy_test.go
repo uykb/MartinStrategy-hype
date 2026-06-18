@@ -269,7 +269,7 @@ func TestUpdateTP_NoChange_SkipsModify(t *testing.T) {
 
 	// 设置 lastTPQty 为截断后的 posSize，模拟上次 TP 已对齐
 	s.mu.Lock()
-	s.lastTPQty = utils.ToFixed(math.Abs(posSize), s.quantityPrecision)
+	s.lastTPQty = utils.FloorToDecimals(math.Abs(posSize), s.quantityPrecision)
 	s.lastTPPrice = 51.0
 	s.mu.Unlock()
 
@@ -307,7 +307,7 @@ func TestUpdateTP_SizeChanged_UsesModify(t *testing.T) {
 
 	// 设置 lastTPQty 为旧仓位（与新仓位不同）
 	s.mu.Lock()
-	s.lastTPQty = utils.ToFixed(initialSize, s.quantityPrecision)
+	s.lastTPQty = utils.FloorToDecimals(initialSize, s.quantityPrecision)
 	s.lastTPPrice = 51.0
 	s.mu.Unlock()
 
@@ -329,7 +329,7 @@ func TestUpdateTP_SizeChanged_UsesModify(t *testing.T) {
 	}
 
 	// 验证 Modify 参数
-	expectedQty := utils.ToFixed(newSize, s.quantityPrecision)
+	expectedQty := utils.FloorToDecimals(newSize, s.quantityPrecision)
 	if adapter.lastModifyQty != expectedQty {
 		t.Errorf("Modify 数量错误: 期望 %f, 实际 %f", expectedQty, adapter.lastModifyQty)
 	}
@@ -359,7 +359,7 @@ func TestUpdateTP_ModifyFails_FallsBackToCancelCreate(t *testing.T) {
 	setupInPosition(s, adapter, newSize, entryPrice, tpID)
 
 	s.mu.Lock()
-	s.lastTPQty = utils.ToFixed(initialSize, s.quantityPrecision)
+	s.lastTPQty = utils.FloorToDecimals(initialSize, s.quantityPrecision)
 	s.lastTPPrice = 51.0
 	s.mu.Unlock()
 
@@ -383,7 +383,7 @@ func TestUpdateTP_ModifyFails_FallsBackToCancelCreate(t *testing.T) {
 	}
 
 	// 验证 lastTPQty 已更新
-	expectedQty := utils.ToFixed(newSize, s.quantityPrecision)
+	expectedQty := utils.FloorToDecimals(newSize, s.quantityPrecision)
 	s.mu.RLock()
 	updatedQty := s.lastTPQty
 	tpIDAfter := s.currentTPOrderID
@@ -467,7 +467,7 @@ func TestUpdateTP_NoExistingTP_CreatesNew(t *testing.T) {
 	}
 
 	// 验证 lastTPQty 已更新
-	expectedQty := utils.ToFixed(posSize, s.quantityPrecision)
+	expectedQty := utils.FloorToDecimals(posSize, s.quantityPrecision)
 	s.mu.RLock()
 	updatedQty := s.lastTPQty
 	s.mu.RUnlock()
@@ -527,7 +527,7 @@ func TestSafeUpdateTP_ConcurrentFills_DirtyFlag(t *testing.T) {
 	finalQty := s.lastTPQty
 	s.mu.RUnlock()
 
-	expectedQty := utils.ToFixed(200.0, s.quantityPrecision)
+	expectedQty := utils.FloorToDecimals(200.0, s.quantityPrecision)
 	if finalQty != expectedQty {
 		t.Errorf("并发成交后 TP 数量应为 %f（总仓位），实际 %f", expectedQty, finalQty)
 	}
@@ -573,7 +573,7 @@ func TestUpdateTP_PrecisionTruncation(t *testing.T) {
 
 	// lastTPQty = 100.00（截断后的值）
 	s.mu.Lock()
-	s.lastTPQty = utils.ToFixed(100.0, s.quantityPrecision) // = 100.00
+	s.lastTPQty = utils.FloorToDecimals(100.0, s.quantityPrecision) // = 100.00
 	s.mu.Unlock()
 
 	adapter.setKlines("30m", 50, entryPrice)
@@ -588,5 +588,317 @@ func TestUpdateTP_PrecisionTruncation(t *testing.T) {
 	}
 	if adapter.createOrderCount != 0 {
 		t.Errorf("截断后仓位相同应跳过 CreateOrder，实际调用了 %d 次", adapter.createOrderCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 网格放置完整性测试
+// ---------------------------------------------------------------------------
+
+// TestPlaceOrderWithRetry_ReturnsFalseOnFailure 验证下单失败时返回 false。
+func TestPlaceOrderWithRetry_ReturnsFalseOnFailure(t *testing.T) {
+	adapter := newMockAdapter()
+	s := newTestStrategy(t, adapter)
+
+	adapter.createErr = fmt.Errorf("insufficient balance")
+
+	result := s.placeOrderWithRetry(exchange.OrderSideBuy, exchange.OrderTypeLimit, 1.0, 50.0, 1)
+
+	if result {
+		t.Error("下单失败时应返回 false，实际返回 true")
+	}
+	if adapter.createOrderCount != 3 {
+		t.Errorf("应重试 3 次，实际调用了 %d 次", adapter.createOrderCount)
+	}
+}
+
+// TestPlaceOrderWithRetry_ReturnsTrueOnSuccess 验证下单成功时返回 true。
+func TestPlaceOrderWithRetry_ReturnsTrueOnSuccess(t *testing.T) {
+	adapter := newMockAdapter()
+	s := newTestStrategy(t, adapter)
+
+	result := s.placeOrderWithRetry(exchange.OrderSideBuy, exchange.OrderTypeLimit, 1.0, 50.0, 1)
+
+	if !result {
+		t.Error("下单成功时应返回 true，实际返回 false")
+	}
+	if adapter.createOrderCount != 1 {
+		t.Errorf("成功时应只调用 1 次，实际调用了 %d 次", adapter.createOrderCount)
+	}
+}
+
+// TestSafeUpdateTP_DirtyLoop_MaxRetries 验证 dirty 循环有最大重试限制。
+// 模拟高频并发场景：持续有新的 safeUpdateTP 调用设置 dirty，验证不会无限循环。
+func TestSafeUpdateTP_DirtyLoop_MaxRetries(t *testing.T) {
+	adapter := newMockAdapter()
+	s := newTestStrategy(t, adapter)
+
+	entryPrice := 50.0
+	tpID := int64(10001)
+
+	adapter.setPos(100.0, entryPrice)
+	adapter.setKlines("30m", 50, entryPrice)
+
+	s.mu.Lock()
+	s.currentState = StateInPosition
+	s.gridPlaced = true
+	s.currentTPOrderID = tpID
+	s.lastTPQty = 0 // 触发 updateTP 执行
+	s.mu.Unlock()
+
+	// 持续设置 dirty 标志，模拟高频并发调用
+	stopDirty := make(chan struct{})
+	dirtyCount := 0
+	go func() {
+		for {
+			select {
+			case <-stopDirty:
+				return
+			default:
+				s.tpDirty.Store(true)
+				dirtyCount++
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}()
+
+	// 执行 safeUpdateTP
+	start := time.Now()
+	s.safeUpdateTP()
+	elapsed := time.Since(start)
+
+	close(stopDirty)
+
+	// 验证：不应无限循环，应在合理时间内完成（< 5 秒）
+	if elapsed > 5*time.Second {
+		t.Errorf("safeUpdateTP 执行时间过长 (%v)，可能存在无限循环", elapsed)
+	}
+
+	// 验证：updateTP 应被调用至少 1 次（初始执行）+ 最多 3 次（dirty 重跑）
+	// 总计最多 4 次，但不会无限循环
+	if adapter.modifyOrderCount == 0 && adapter.createOrderCount == 0 {
+		// 如果 lastTPQty == lastTPQty（仓位未变化），updateTP 会跳过
+		// 这种情况下不调用 API 是正常的
+		t.Log("仓位未变化，updateTP 跳过 API 调用（正常行为）")
+	}
+}
+
+// TestHandleOrderUpdate_SafetyFill_AlwaysTriggersTP 验证安全订单成交时
+// 无论 gridPlaced 状态如何，始终触发 TP 更新。
+// 审计修复：gridPlaced 仅控制网格放置，不应阻止 TP 更新。
+func TestHandleOrderUpdate_SafetyFill_AlwaysTriggersTP(t *testing.T) {
+	adapter := newMockAdapter()
+	s := newTestStrategy(t, adapter)
+
+	entryPrice := 50.0
+	adapter.setPos(100.0, entryPrice)
+	adapter.setKlines("30m", 50, entryPrice)
+
+	// 设置状态为 IN_POSITION 但 gridPlaced=false（重启后不完整网格场景）
+	s.mu.Lock()
+	s.currentState = StateInPosition
+	s.gridPlaced = false
+	s.currentTPOrderID = 10001
+	s.lastTPQty = 50.0 // 旧仓位，与新仓位不同
+	s.mu.Unlock()
+
+	// 模拟安全订单成交
+	event := core.Event{
+		Type: core.EventOrderUpdate,
+		Data: &exchange.OrderUpdate{
+			OrderID:   20001,
+			Symbol:    "HYPE",
+			Side:      exchange.OrderSideBuy,
+			Type:      exchange.OrderTypeLimit,
+			Status:    "FILLED",
+			ExecPrice: 48.0,
+			Quantity:  0.5,
+		},
+	}
+
+	err := s.handleOrderUpdate(context.Background(), event)
+	if err != nil {
+		t.Fatalf("handleOrderUpdate 失败: %v", err)
+	}
+
+	// 等待 goroutine 执行
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证：无论 gridPlaced 如何，安全订单成交都应触发 TP 更新
+	if adapter.modifyOrderCount == 0 && adapter.createOrderCount == 0 {
+		t.Error("安全订单成交应始终触发 TP 更新，但未调用任何订单 API")
+	}
+}
+
+// TestHandleOrderUpdate_SafetyFill_GridPlaced_TriggersTP 验证安全订单成交时
+// 如果网格已放置，触发 TP 更新。
+func TestHandleOrderUpdate_SafetyFill_GridPlaced_TriggersTP(t *testing.T) {
+	adapter := newMockAdapter()
+	s := newTestStrategy(t, adapter)
+
+	entryPrice := 50.0
+	adapter.setPos(100.0, entryPrice)
+	adapter.setKlines("30m", 50, entryPrice)
+
+	// 设置状态为 IN_POSITION 且 gridPlaced=true
+	s.mu.Lock()
+	s.currentState = StateInPosition
+	s.gridPlaced = true
+	s.currentTPOrderID = 10001
+	s.lastTPQty = 50.0 // 旧仓位，与新仓位不同
+	s.mu.Unlock()
+
+	// 模拟安全订单成交
+	event := core.Event{
+		Type: core.EventOrderUpdate,
+		Data: &exchange.OrderUpdate{
+			OrderID:   20001,
+			Symbol:    "HYPE",
+			Side:      exchange.OrderSideBuy,
+			Type:      exchange.OrderTypeLimit,
+			Status:    "FILLED",
+			ExecPrice: 48.0,
+			Quantity:  0.5,
+		},
+	}
+
+	err := s.handleOrderUpdate(context.Background(), event)
+	if err != nil {
+		t.Fatalf("handleOrderUpdate 失败: %v", err)
+	}
+
+	// 等待 goroutine 执行
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证：应触发 TP 更新
+	if adapter.modifyOrderCount == 0 && adapter.createOrderCount == 0 {
+		t.Error("网格已放置时安全订单成交应触发 TP 更新，但未调用任何订单 API")
+	}
+}
+
+// TestSyncState_IncompleteGrid_DetectsAndAllowsReplacement 验证 syncState 检测到
+// 不完整网格时设置 gridPlaced=false 允许重新放置。
+func TestSyncState_IncompleteGrid_DetectsAndAllowsReplacement(t *testing.T) {
+	adapter := newMockAdapter()
+	s := newTestStrategy(t, adapter)
+
+	// 设置持仓
+	adapter.setPos(100.0, 50.0)
+
+	// 模拟不完整的网格订单（只有 3 个买单，期望 9 个）
+	adapter.openOrders = []exchange.OpenOrder{
+		{OrderID: 1, Side: exchange.OrderSideBuy, Type: exchange.OrderTypeLimit, Price: 49.0},
+		{OrderID: 2, Side: exchange.OrderSideBuy, Type: exchange.OrderTypeLimit, Price: 48.0},
+		{OrderID: 3, Side: exchange.OrderSideBuy, Type: exchange.OrderTypeLimit, Price: 47.0},
+		{OrderID: 4, Side: exchange.OrderSideSell, Type: exchange.OrderTypeLimit, Price: 55.0}, // TP
+	}
+
+	s.syncState()
+
+	s.mu.RLock()
+	state := s.currentState
+	gridPlaced := s.gridPlaced
+	s.mu.RUnlock()
+
+	if state != StateInPosition {
+		t.Errorf("有持仓时状态应为 IN_POSITION，实际 %s", state)
+	}
+	if gridPlaced {
+		t.Error("网格不完整时 gridPlaced 应为 false，实际为 true")
+	}
+}
+
+// TestSyncState_CompleteGrid_SetsGridPlaced 验证 syncState 检测到完整网格时
+// 设置 gridPlaced=true。
+func TestSyncState_CompleteGrid_SetsGridPlaced(t *testing.T) {
+	adapter := newMockAdapter()
+	s := newTestStrategy(t, adapter)
+
+	// 设置持仓
+	adapter.setPos(100.0, 50.0)
+
+	// 模拟完整的网格订单（9 个买单 + 1 个 TP 卖单）
+	orders := []exchange.OpenOrder{
+		{OrderID: 1, Side: exchange.OrderSideSell, Type: exchange.OrderTypeLimit, Price: 55.0}, // TP
+	}
+	for i := 2; i <= 10; i++ {
+		orders = append(orders, exchange.OpenOrder{
+			OrderID: int64(i),
+			Side:    exchange.OrderSideBuy,
+			Type:    exchange.OrderTypeLimit,
+			Price:   50.0 - float64(i)*1.0,
+		})
+	}
+	adapter.openOrders = orders
+
+	s.syncState()
+
+	s.mu.RLock()
+	state := s.currentState
+	gridPlaced := s.gridPlaced
+	s.mu.RUnlock()
+
+	if state != StateInPosition {
+		t.Errorf("有持仓时状态应为 IN_POSITION，实际 %s", state)
+	}
+	if !gridPlaced {
+		t.Error("网格完整时 gridPlaced 应为 true，实际为 false")
+	}
+}
+
+// TestSyncState_WithTP_InitializesLastTPQty 验证 syncState 检测到已有 TP 时
+// 初始化 lastTPQty 为当前持仓量，防止 resyncViaREST 触发不必要的 TP 重建。
+func TestSyncState_WithTP_InitializesLastTPQty(t *testing.T) {
+	adapter := newMockAdapter()
+	s := newTestStrategy(t, adapter)
+
+	posSize := 100.0
+	entryPrice := 50.0
+	adapter.setPos(posSize, entryPrice)
+
+	// 模拟完整网格 + TP
+	orders := []exchange.OpenOrder{
+		{OrderID: 1, Side: exchange.OrderSideSell, Type: exchange.OrderTypeLimit, Price: 55.0}, // TP
+	}
+	for i := 2; i <= 10; i++ {
+		orders = append(orders, exchange.OpenOrder{
+			OrderID: int64(i),
+			Side:    exchange.OrderSideBuy,
+			Type:    exchange.OrderTypeLimit,
+			Price:   entryPrice - float64(i)*1.0,
+		})
+	}
+	adapter.openOrders = orders
+
+	// 确保 lastTPQty 初始为 0（模拟重启后内存丢失）
+	s.mu.Lock()
+	s.lastTPQty = 0
+	s.mu.Unlock()
+
+	s.syncState()
+
+	s.mu.RLock()
+	lastTPQty := s.lastTPQty
+	currentTPOrderID := s.currentTPOrderID
+	s.mu.RUnlock()
+
+	expectedQty := utils.FloorToDecimals(posSize, s.quantityPrecision)
+
+	// 验证：lastTPQty 应被初始化为当前持仓量
+	if lastTPQty != expectedQty {
+		t.Errorf("lastTPQty 应初始化为 %f，实际 %f", expectedQty, lastTPQty)
+	}
+
+	// 验证：currentTPOrderID 应被设置
+	if currentTPOrderID != 1 {
+		t.Errorf("currentTPOrderID 应为 1，实际 %d", currentTPOrderID)
+	}
+
+	// 验证：不应触发 safeUpdateTP（因为 lastTPQty 已对齐，仓位变化检测会跳过）
+	if adapter.modifyOrderCount != 0 {
+		t.Errorf("lastTPQty 已对齐时不应调用 ModifyOrder，实际 %d 次", adapter.modifyOrderCount)
+	}
+	if adapter.createOrderCount != 0 {
+		t.Errorf("lastTPQty 已对齐时不应调用 CreateOrder，实际 %d 次", adapter.createOrderCount)
 	}
 }

@@ -31,13 +31,13 @@ import (
 
 // wsRequest 表示发往 Hyperliquid WebSocket 的请求
 type wsRequest struct {
-	Method      string      `json:"method"`                // "subscribe" | "unsubscribe" | "ping"
+	Method       string          `json:"method"`                 // "subscribe" | "unsubscribe" | "ping"
 	Subscription *wsSubscription `json:"subscription,omitempty"` // 订阅参数
 }
 
 // wsSubscription 表示订阅参数
 type wsSubscription struct {
-	Type string `json:"type"` // "l2Book" | "trades" | "userFills" | "orderUpdates" | "allMids"
+	Type string `json:"type"`           // "l2Book" | "trades" | "userFills" | "orderUpdates" | "allMids"
 	Coin string `json:"coin,omitempty"` // 交易对（公有流需要）
 	User string `json:"user,omitempty"` // 用户地址（私有流需要）
 }
@@ -56,16 +56,16 @@ type wsEnvelope struct {
 
 // wsL2BookData 表示 l2Book 频道的数据
 type wsL2BookData struct {
-	Coin   string       `json:"coin"`
-	Levels [][]wsLevel  `json:"levels"` // [0]=bids, [1]=asks
-	Time   int64        `json:"time"`
+	Coin   string      `json:"coin"`
+	Levels [][]wsLevel `json:"levels"` // [0]=bids, [1]=asks
+	Time   int64       `json:"time"`
 }
 
 // wsLevel 表示 L2 盘口的一个价位
 type wsLevel struct {
-	Px  float64 `json:"px,string"`
-	Sz  float64 `json:"sz,string"`
-	N   int     `json:"n"`
+	Px float64 `json:"px,string"`
+	Sz float64 `json:"sz,string"`
+	N  int     `json:"n"`
 }
 
 // wsTradeData 表示 trades 频道的数据
@@ -84,15 +84,15 @@ type wsUserFillData struct {
 
 // wsFill 表示一笔成交回报
 type wsFill struct {
-	Coin      string  `json:"coin"`
-	Side      string  `json:"side"` // "B"=buy, "S"=sell
-	Px        float64 `json:"px,string"`
-	Sz        float64 `json:"sz,string"`
-	Time      int64   `json:"time"`
-	Hash      string  `json:"hash"`
-	Oid       int64   `json:"oid,omitempty"` // 订单 ID
-	Crossed   bool    `json:"crossed"`
-	Directed  bool    `json:"directed"`
+	Coin     string  `json:"coin"`
+	Side     string  `json:"side"` // "B"=buy, "S"=sell
+	Px       float64 `json:"px,string"`
+	Sz       float64 `json:"sz,string"`
+	Time     int64   `json:"time"`
+	Hash     string  `json:"hash"`
+	Oid      int64   `json:"oid,omitempty"` // 订单 ID
+	Crossed  bool    `json:"crossed"`
+	Directed bool    `json:"directed"`
 }
 
 // wsOrderUpdateData 表示 orderUpdates 频道的订单更新数据
@@ -148,8 +148,8 @@ const (
 // WSManager 管理 Hyperliquid WebSocket 连接的生命周期，
 // 包括双通道订阅、心跳、重连与 REST 对账。
 type WSManager struct {
-	cfg    *HyperliquidConfig // 交易所配置
-	bus    *core.EventBus     // 事件总线
+	cfg     *HyperliquidConfig  // 交易所配置
+	bus     *core.EventBus      // 事件总线
 	adapter *HyperliquidAdapter // 反向引用，用于 REST 对账
 
 	// WebSocket 连接
@@ -164,7 +164,7 @@ type WSManager struct {
 	pongCh chan struct{} // 收到 pong 时发信号
 
 	// 重连状态
-	reconnectMu sync.Mutex
+	reconnectMu  sync.Mutex
 	reconnecting bool
 
 	// ★ P2 加固：WS 活跃状态标志（atomic，供 REST 降级和健康检查查询）
@@ -174,8 +174,8 @@ type WSManager struct {
 	subscriptions []wsSubscription
 
 	// 事件 channel（带缓冲，防止高频行情阻塞网络 I/O）
-	priceEventCh  chan *PriceUpdate     // 价格更新缓冲 channel（带时间戳防滑点）
-	orderEventCh  chan *OrderUpdate     // 订单更新缓冲 channel
+	priceEventCh chan *PriceUpdate // 价格更新缓冲 channel（带时间戳防滑点）
+	orderEventCh chan *OrderUpdate // 订单更新缓冲 channel
 
 	// WaitGroup 用于优雅关闭
 	wg sync.WaitGroup
@@ -185,14 +185,14 @@ type WSManager struct {
 func NewWSManager(cfg *HyperliquidConfig, bus *core.EventBus, adapter *HyperliquidAdapter) *WSManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &WSManager{
-		cfg:       cfg,
-		bus:       bus,
-		adapter:   adapter,
-		ctx:       ctx,
-		cancel:    cancel,
-		pongCh:    make(chan struct{}, 1),
-		priceEventCh:  make(chan *PriceUpdate, 500),  // 500 缓冲，防止高频行情丢失
-		orderEventCh:  make(chan *OrderUpdate, 200), // 200 缓冲，防止成交回报丢失
+		cfg:          cfg,
+		bus:          bus,
+		adapter:      adapter,
+		ctx:          ctx,
+		cancel:       cancel,
+		pongCh:       make(chan struct{}, 1),
+		priceEventCh: make(chan *PriceUpdate, 500), // 500 缓冲，防止高频行情丢失
+		orderEventCh: make(chan *OrderUpdate, 200), // 200 缓冲，防止成交回报丢失
 	}
 }
 
@@ -324,7 +324,7 @@ func (w *WSManager) sendSubscriptions() error {
 
 	for _, sub := range w.subscriptions {
 		req := wsRequest{
-			Method:      "subscribe",
+			Method:       "subscribe",
 			Subscription: &sub,
 		}
 		data, err := json.Marshal(req)

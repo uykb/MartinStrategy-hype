@@ -43,7 +43,7 @@ type HealthServer struct {
 	wg     sync.WaitGroup
 
 	// 外部状态数据源
-	wsProvider      WSStatusProvider
+	wsProvider       WSStatusProvider
 	strategyProvider StrategyStatusProvider
 
 	// 启动时间（用于计算运行时长）
@@ -104,8 +104,8 @@ func (h *HealthServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":    "ok",
-		"uptime_s":  time.Since(h.startTime).Seconds(),
+		"status":   "ok",
+		"uptime_s": time.Since(h.startTime).Seconds(),
 	})
 }
 
@@ -134,10 +134,10 @@ func (h *HealthServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"ready":         ready,
-		"ws_active":     wsActive,
+		"ready":          ready,
+		"ws_active":      wsActive,
 		"strategy_state": strategyState,
-		"frozen":        frozen,
-		"uptime_s":      time.Since(h.startTime).Seconds(),
+		"frozen":         frozen,
+		"uptime_s":       time.Since(h.startTime).Seconds(),
 	})
 }

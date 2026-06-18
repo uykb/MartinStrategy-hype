@@ -135,11 +135,11 @@ func NewHyperliquidAdapter(cfg *config.ExchangeConfig, bus *core.EventBus) (*Hyp
 		ctx,
 		privateKey,
 		hlCfg.APIURL,
-		nil,                   // meta: 自动获取
-		"",                    // vault 地址：空表示主账户
-		hlCfg.AccountAddress,  // 主钱包地址
-		nil,                   // spotMeta: 自动获取
-		nil,                   // perpDexs: 自动获取
+		nil,                  // meta: 自动获取
+		"",                   // vault 地址：空表示主账户
+		hlCfg.AccountAddress, // 主钱包地址
+		nil,                  // spotMeta: 自动获取
+		nil,                  // perpDexs: 自动获取
 	)
 
 	// 初始化查询客户端
@@ -334,8 +334,12 @@ func (h *HyperliquidAdapter) GetBalance() (float64, error) {
 	withdrawable, _ := strconv.ParseFloat(userState.Withdrawable, 64)
 
 	balance = marginVal
-	if crossVal > balance { balance = crossVal }
-	if withdrawable > balance { balance = withdrawable }
+	if crossVal > balance {
+		balance = crossVal
+	}
+	if withdrawable > balance {
+		balance = withdrawable
+	}
 
 	utils.Logger.Info("余额查询",
 		zap.Float64("marginSummary", marginVal),

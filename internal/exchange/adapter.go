@@ -44,12 +44,12 @@ type Position struct {
 
 // OpenOrder 表示一个挂单（未成交订单）
 type OpenOrder struct {
-	OrderID  int64        // 交易所返回的订单 ID
-	Side     OrderSide    // 买 / 卖
+	OrderID  int64         // 交易所返回的订单 ID
+	Side     OrderSide     // 买 / 卖
 	Type     OrderTypeKind // 限价 / 市价
-	Price    float64      // 挂单价格
-	Quantity float64      // 挂单数量
-	Symbol   string       // 交易对
+	Price    float64       // 挂单价格
+	Quantity float64       // 挂单数量
+	Symbol   string        // 交易对
 }
 
 // OrderResponse 表示下单后的交易所响应
@@ -61,13 +61,13 @@ type OrderResponse struct {
 // OrderUpdate 表示订单状态变更事件（由 WebSocket 推送）
 // 该结构体会被封装为 EventOrderUpdate 注入 FSM
 type OrderUpdate struct {
-	OrderID   int64        // 订单 ID
-	Symbol    string       // 交易对
-	Side      OrderSide    // 买 / 卖
+	OrderID   int64         // 订单 ID
+	Symbol    string        // 交易对
+	Side      OrderSide     // 买 / 卖
 	Type      OrderTypeKind // 限价 / 市价
-	Status    string       // "FILLED" | "CANCELED" | "PARTIALLY_FILLED" 等
-	ExecPrice float64      // 成交均价
-	Quantity  float64      // 成交数量
+	Status    string        // "FILLED" | "CANCELED" | "PARTIALLY_FILLED" 等
+	ExecPrice float64       // 成交均价
+	Quantity  float64       // 成交数量
 }
 
 // PriceUpdate 表示带时间戳的价格更新事件。
@@ -76,7 +76,7 @@ type OrderUpdate struct {
 // 在 REST 降级模式下使用本地时间。
 type PriceUpdate struct {
 	Price     float64 // 最新价格
-	Timestamp int64    // 毫秒时间戳（来自 WS 服务器时间或本地时间）
+	Timestamp int64   // 毫秒时间戳（来自 WS 服务器时间或本地时间）
 }
 
 // IsStale 判断价格更新是否已过期。

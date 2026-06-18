@@ -68,7 +68,7 @@ func InitStorage(sqlitePath, redisAddr, redisPass string, redisDB int) (*Databas
 		rdb = redis.NewClient(&redis.Options{
 			Addr:            redisAddr,
 			Password:        redisPass,
-			DB:               redisDB,
+			DB:              redisDB,
 			MaxRetries:      1,
 			PoolSize:        3,
 			MinIdleConns:    1,
