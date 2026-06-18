@@ -102,6 +102,11 @@ type MartingaleStrategy struct {
 	// ★ P1 加固：生命周期控制
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// ★ 运行时修复：启动时间戳，用于忽略 WS 推送的历史订单事件。
+	// Hyperliquid WS 订阅 orderUpdates 后会立即推送历史订单状态（含已成交），
+	// 在启动宽限期内（2 秒）忽略这些事件，防止误触发开仓/网格放置。
+	startTime time.Time
 }
 
 // NewMartingaleStrategy 创建策略实例
@@ -117,6 +122,7 @@ func NewMartingaleStrategy(cfg *config.StrategyConfig, ex exchange.ExchangeAdapt
 		waitStopCh:   make(chan struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
+		startTime:    time.Now(),
 	}
 }
 
@@ -512,6 +518,17 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 	)
 
 	if order.Status == "FILLED" {
+		// ★ 运行时修复：启动宽限期内忽略历史成交事件。
+		// Hyperliquid WS 订阅 orderUpdates 后会立即推送历史订单状态（含已成交），
+		// 这些是启动前的旧事件，不应触发开仓或网格放置。
+		if time.Since(s.startTime) < 2*time.Second {
+			utils.Logger.Info("启动宽限期内忽略历史成交事件",
+				zap.Int64("id", order.OrderID),
+				zap.String("side", string(order.Side)),
+				zap.Duration("since_start", time.Since(s.startTime)))
+			return nil
+		}
+
 		if order.Side == exchange.OrderSideBuy {
 			utils.Logger.Info("买单成交",
 				zap.String("type", string(order.Type)),
@@ -762,10 +779,21 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 	// ★ 审计修复：数量使用 FloorToDecimals 向下取整，杜绝四舍五入
 	baseQty = utils.FloorToDecimals(baseQty, s.quantityPrecision)
 
+	// ★ 运行时修复：Floor 截断后金额可能略低于 MinNotional（如 9.44 < 10），
+	// 需要向上微调一个 stepSize 确保满足交易所最低金额要求。
+	if baseQty*currentPrice < minNotional {
+		baseQty = utils.FloorToDecimals(baseQty+s.stepSize, s.quantityPrecision)
+		utils.Logger.Info("金额不足，微调数量",
+			zap.Float64("adjusted_qty", baseQty),
+			zap.Float64("value", baseQty*currentPrice),
+			zap.Float64("min_notional", minNotional))
+	}
+
 	utils.Logger.Info("计算基础下单量",
 		zap.Float64("price", currentPrice),
 		zap.Float64("unit_qty", unitQty),
 		zap.Float64("base_qty", baseQty),
+		zap.Float64("value", baseQty*currentPrice),
 	)
 
 	_, err := s.exchange.CreateOrder(exchange.OrderSideBuy, exchange.OrderTypeMarket, baseQty, currentPrice)
@@ -951,6 +979,17 @@ func (s *MartingaleStrategy) placeGridOrders() {
 		// ★ 审计修复：数量严格向下取整，防止余额不足和幽灵尾仓
 		qty = utils.FloorToTickSize(qty, s.stepSize)
 		qty = utils.FloorToDecimals(qty, s.quantityPrecision)
+
+		// ★ 运行时修复：Floor 截断后金额可能略低于 MinNotional，
+		// 需要向上微调一个 stepSize 确保满足交易所最低金额要求。
+		if qty*price < minNotional {
+			qty = utils.FloorToDecimals(qty+s.stepSize, s.quantityPrecision)
+			utils.Logger.Info("Floor 截断后金额不足，微调数量",
+				zap.Int("index", i),
+				zap.Float64("adjusted_qty", qty),
+				zap.Float64("value", qty*price),
+				zap.Float64("min_notional", minNotional))
+		}
 
 		utils.Logger.Info("放置安全订单",
 			zap.Int("index", i),

@@ -244,6 +244,9 @@ func newTestStrategy(t *testing.T, adapter *mockAdapter) *MartingaleStrategy {
 	s.szDecimals = 2
 	s.maxPriceDecimals = 4
 
+	// ★ 设置 startTime 为过去时间，绕过启动宽限期检查
+	s.startTime = time.Now().Add(-10 * time.Second)
+
 	return s
 }
 
