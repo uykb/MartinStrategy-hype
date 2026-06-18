@@ -320,31 +320,52 @@ func (h *HyperliquidAdapter) GetPosition() (*Position, error) {
 	}, nil
 }
 
-// GetBalance 获取账户 USDC 余额
+// GetBalance 获取账户 USDC 余额。
+// ★ 统一账户支持：同时查询永续合约账户和现货账户，取可用余额。
+// Hyperliquid 统一账户的 USDC 存放在现货账户中，永续合约账户返回 0。
 func (h *HyperliquidAdapter) GetBalance() (float64, error) {
+	// 1. 查询永续合约账户余额
 	userState, err := h.infoClient.UserState(h.ctx, h.cfg.AccountAddress)
 	if err != nil {
 		return 0, fmt.Errorf("获取用户状态失败: %w", err)
 	}
 
-	// 余额可能分布在多个字段，取最大值
-	var balance float64
+	var perpBalance float64
 	marginVal, _ := strconv.ParseFloat(userState.MarginSummary.AccountValue, 64)
 	crossVal, _ := strconv.ParseFloat(userState.CrossMarginSummary.AccountValue, 64)
 	withdrawable, _ := strconv.ParseFloat(userState.Withdrawable, 64)
 
-	balance = marginVal
-	if crossVal > balance {
-		balance = crossVal
+	perpBalance = marginVal
+	if crossVal > perpBalance {
+		perpBalance = crossVal
 	}
-	if withdrawable > balance {
-		balance = withdrawable
+	if withdrawable > perpBalance {
+		perpBalance = withdrawable
+	}
+
+	// 2. 查询现货账户余额（统一账户的 USDC 存放在现货账户中）
+	var spotUSDC float64
+	spotState, spotErr := h.infoClient.SpotUserState(h.ctx, h.cfg.AccountAddress)
+	if spotErr != nil {
+		utils.Logger.Warn("查询现货账户余额失败", zap.Error(spotErr))
+	} else {
+		for _, b := range spotState.Balances {
+			if b.Coin == "USDC" {
+				spotUSDC, _ = strconv.ParseFloat(b.Total, 64)
+				break
+			}
+		}
+	}
+
+	// 3. 取两者的最大值作为可用余额
+	balance := perpBalance
+	if spotUSDC > balance {
+		balance = spotUSDC
 	}
 
 	utils.Logger.Info("余额查询",
-		zap.Float64("marginSummary", marginVal),
-		zap.Float64("crossMargin", crossVal),
-		zap.Float64("withdrawable", withdrawable),
+		zap.Float64("perp_balance", perpBalance),
+		zap.Float64("spot_usdc", spotUSDC),
 		zap.Float64("used", balance))
 
 	return balance, nil
