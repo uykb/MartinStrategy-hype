@@ -280,6 +280,10 @@ func (s *MartingaleStrategy) syncState() {
 
 	if pos != nil && math.Abs(pos.Size) > 0 {
 		s.currentState = StateInPosition
+		// ★ 业务逻辑：重启时有持仓，gridPlaced 始终设为 true。
+		// 不检测网格完整性、不重新放置——链上已有的网格订单是唯一的真相。
+		// 如果部分网格已成交（如 5/9），重启后重新放置 9 层会导致总共 14 层，
+		// 杠杆过高造成爆仓风险。缺失的网格层级是可接受的（少一层保护而已）。
 		s.gridPlaced = true
 		utils.Logger.Info("状态同步：检测到持仓",
 			zap.String("state", string(s.currentState)),
@@ -291,9 +295,8 @@ func (s *MartingaleStrategy) syncState() {
 			utils.Logger.Error("获取挂单列表失败", zap.Error(err))
 			s.mu.Unlock()
 		} else {
-			// ★ 修复：验证网格订单完整性
-			gridCount := 0
 			hasTP := false
+			gridCount := 0
 			for _, o := range orders {
 				if o.Side == exchange.OrderSideBuy {
 					gridCount++
@@ -305,22 +308,12 @@ func (s *MartingaleStrategy) syncState() {
 				}
 			}
 
-			// ★ 修复：如果网格订单不完整，设置 gridPlaced=false 允许重新放置
-			needGridRebuild := false
-			if gridCount < s.cfg.MaxSafetyOrders {
-				utils.Logger.Warn("网格订单不完整，将重新放置",
-					zap.Int("existing_grid_count", gridCount),
-					zap.Int("expected", s.cfg.MaxSafetyOrders))
-				s.gridPlaced = false
-				needGridRebuild = true
-			} else {
-				utils.Logger.Info("网格订单完整",
-					zap.Int("grid_count", gridCount))
-			}
+			utils.Logger.Info("网格订单状态（不修改，保持链上原样）",
+				zap.Int("grid_count", gridCount),
+				zap.Int("max_safety_orders", s.cfg.MaxSafetyOrders))
 
 			if !hasTP {
 				utils.Logger.Warn("检测到持仓但无 TP 订单，正在恢复 TP...")
-				// 先释放锁，再启动 goroutine（safeUpdateTP 需要 mu.RLock）
 				s.mu.Unlock()
 				go func() {
 					defer func() {
@@ -336,24 +329,9 @@ func (s *MartingaleStrategy) syncState() {
 				s.lastTPQty = utils.FloorToDecimals(math.Abs(pos.Size), s.quantityPrecision)
 				utils.Logger.Info("状态已恢复，TP 订单存在",
 					zap.Int("open_orders", len(orders)),
+					zap.Int("grid_orders", gridCount),
 					zap.Float64("initialized_lastTPQty", s.lastTPQty))
-				// 先释放锁，再启动 goroutine
 				s.mu.Unlock()
-			}
-
-			// ★ 修复：网格不完整时，启动 goroutine 重新放置网格。
-			// 必须在 mu.Unlock() 之后调用，因为 placeGridOrders 需要 mu.RLock。
-			if needGridRebuild {
-				utils.Logger.Info("启动网格重新放置...")
-				go func() {
-					defer func() {
-						if r := recover(); r != nil {
-							utils.Logger.Error("syncState placeGridOrders goroutine panic", zap.Any("recover", r))
-						}
-					}()
-					time.Sleep(200 * time.Millisecond)
-					s.safePlaceGridOrders()
-				}()
 			}
 		}
 	} else {

@@ -790,9 +790,9 @@ func TestHandleOrderUpdate_SafetyFill_GridPlaced_TriggersTP(t *testing.T) {
 	}
 }
 
-// TestSyncState_IncompleteGrid_DetectsAndAllowsReplacement 验证 syncState 检测到
-// 不完整网格时设置 gridPlaced=false 允许重新放置。
-func TestSyncState_IncompleteGrid_DetectsAndAllowsReplacement(t *testing.T) {
+// TestSyncState_IncompleteGrid_KeepsGridPlaced 验证 syncState 检测到不完整网格时
+// 仍然设置 gridPlaced=true（不重新放置，防止爆仓风险）。
+func TestSyncState_IncompleteGrid_KeepsGridPlaced(t *testing.T) {
 	adapter := newMockAdapter()
 	s := newTestStrategy(t, adapter)
 
@@ -817,8 +817,9 @@ func TestSyncState_IncompleteGrid_DetectsAndAllowsReplacement(t *testing.T) {
 	if state != StateInPosition {
 		t.Errorf("有持仓时状态应为 IN_POSITION，实际 %s", state)
 	}
-	if gridPlaced {
-		t.Error("网格不完整时 gridPlaced 应为 false，实际为 true")
+	// ★ 业务逻辑：重启时有持仓，gridPlaced 始终为 true，不重新放置网格
+	if !gridPlaced {
+		t.Error("重启时有持仓 gridPlaced 应为 true（不重新放置网格），实际为 false")
 	}
 }
 
