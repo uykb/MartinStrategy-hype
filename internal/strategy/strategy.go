@@ -1069,13 +1069,71 @@ func (s *MartingaleStrategy) placeOrderWithRetry(side exchange.OrderSide, orderT
 	return false // 全部重试失败
 }
 
+// findLiveTP 查询交易所端真实存在的 TP 订单（SELL + Limit）。
+//
+// 用途：
+//   - 入口对账：本地 currentTPOrderID == 0 时，认领交易所端可能遗留的 TP，
+//     避免"无本地记录 → 盲目 CreateOrder"产生重复 TP。
+//   - Modify 失败对账：Modify 在 HTTP 层失败但交易所端可能已成功（原子 cancel+place），
+//     通过查询真实状态判断是否需要降级 Create，避免重复 TP。
+//
+// 返回值：
+//   - 找到 TP：(orderID, quantity, price, nil)
+//   - 无 TP：(0, 0, 0, nil)
+//   - 查询失败：(0, 0, 0, err)
+//
+// 异常自愈：若发现多个 TP（历史重复 create 的遗留），保留第一个并异步取消其余，
+// 防止重复 TP 累积。
+func (s *MartingaleStrategy) findLiveTP() (int64, float64, float64, error) {
+	orders, err := s.exchange.GetOpenOrders()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("查询挂单失败: %w", err)
+	}
+
+	var tpOrders []exchange.OpenOrder
+	for _, o := range orders {
+		if o.Side == exchange.OrderSideSell && o.Type == exchange.OrderTypeLimit {
+			tpOrders = append(tpOrders, o)
+		}
+	}
+
+	if len(tpOrders) == 0 {
+		return 0, 0, 0, nil
+	}
+
+	if len(tpOrders) > 1 {
+		utils.Logger.Warn("发现多个 TP 订单（异常状态），保留第一个并取消其余",
+			zap.Int("count", len(tpOrders)),
+			zap.Int64("keep_id", tpOrders[0].OrderID))
+		for i := 1; i < len(tpOrders); i++ {
+			extraID := tpOrders[i].OrderID
+			go func(id int64) {
+				defer func() {
+					if r := recover(); r != nil {
+						utils.Logger.Error("清理多余 TP goroutine panic", zap.Any("recover", r))
+					}
+				}()
+				if err := s.exchange.CancelOrder(id); err != nil {
+					utils.Logger.Warn("清理多余 TP 失败",
+						zap.Int64("order_id", id), zap.Error(err))
+				}
+			}(extraID)
+		}
+	}
+
+	tp := tpOrders[0]
+	return tp.OrderID, tp.Quantity, tp.Price, nil
+}
+
 // updateTP 更新止盈订单
 //
-// 核心逻辑（P1 加固 + 仓位变化检测 + modify 优先）：
+// 核心逻辑（P1 加固 + 仓位变化检测 + modify 优先 + 对账防重复）：
+//   - 入口对账：本地无 TP 记录时查交易所端，认领遗留 TP，避免盲目 create 产生重复
 //   - 仓位大小未变化时跳过更新（不获取 ATR，不修改 TP）
 //   - 仓位大小变化时重新获取 ATR(30m) 计算止盈位置
 //   - 优先使用 ModifyOrder 原子替换，避免取消+重建的空窗期
-//   - Modify 失败时降级到 cancel + create
+//   - Modify 失败时对账交易所端真实状态：modify 实际成功则只同步本地状态，
+//     真未成功才降级 cancel + create，杜绝"网络失败 + 交易所端成功"导致的重复 TP
 //
 // 调用约定：调用方（safeUpdateTP）必须已持有 tpMu 锁。
 func (s *MartingaleStrategy) updateTP() {
@@ -1112,12 +1170,38 @@ func (s *MartingaleStrategy) updateTP() {
 		return
 	}
 
+	// ★ 对账防重复（入口）：本地无 TP 记录时，查交易所端是否已有遗留 TP。
+	// 场景：重启后 currentTPOrderID 丢失 / 卖单事件清零后交易所端 TP 未同步取消 /
+	//       modify 网络失败但交易所端成功后本地状态未更新。
+	// 若不认领，后续会盲目 CreateOrder 产生重复 TP（数量价格完全相同）。
+	// 仅在 oldTPID == 0 时触发，常规路径不增加 GetOpenOrders 开销。
+	if oldTPID == 0 {
+		liveID, liveQty, livePrice, reconcileErr := s.findLiveTP()
+		if reconcileErr != nil {
+			utils.Logger.Warn("入口对账：查询挂单失败，继续以本地状态为准",
+				zap.Error(reconcileErr))
+		} else if liveID != 0 {
+			s.mu.Lock()
+			s.currentTPOrderID = liveID
+			s.lastTPQty = liveQty
+			s.lastTPPrice = livePrice
+			s.mu.Unlock()
+			oldTPID = liveID
+			prevQty = liveQty
+			utils.Logger.Info("入口对账：认领交易所端已存在的 TP",
+				zap.Int64("tp_id", liveID),
+				zap.Float64("qty", liveQty),
+				zap.Float64("price", livePrice))
+		}
+	}
+
 	// ★ 审计修复：TP 数量使用 FloorToDecimals 向下取整，与实际持仓精度对齐。
 	// 确保 tp_qty ≤ 实际持仓量，平仓后不会产生反向微型尾仓。
 	newQty := utils.FloorToDecimals(math.Abs(pos.Size), s.quantityPrecision)
 
 	// ★ 仓位变化检测：如果仓位未变且已有 TP 订单，跳过更新
 	// 此时不获取 ATR、不修改 TP 价格，符合"仓位未变不更新止盈位置"的需求
+	// 入口对账已保证 oldTPID 反映交易所端真实状态，无需担心 oldTPID==0 盲区
 	if newQty == prevQty && oldTPID != 0 {
 		utils.Logger.Debug("updateTP 跳过：仓位未变化",
 			zap.Float64("qty", newQty),
@@ -1176,17 +1260,65 @@ func (s *MartingaleStrategy) updateTP() {
 				zap.Float64("price", tpPrice))
 			return
 		}
-		// modify 失败（可能订单已成交/已取消/交易所拒绝），降级到 cancel+create
-		utils.Logger.Warn("Modify TP 失败，降级到 cancel+create",
+		// modify 失败（可能订单已成交/已取消/交易所拒绝/HTTP 超时）。
+		// ★ 对账防重复：Hyperliquid modify 等价于原子 cancel+place，HTTP 失败时
+		// 交易所端可能已成功。盲目降级 cancel+create 会产生重复 TP（数量价格相同）。
+		// 通过查询真实状态判断：
+		//   - liveID != oldTPID：modify 实际成功（新 TP 已在），只同步本地状态，跳过 create
+		//   - liveID == oldTPID：modify 真未生效，旧 TP 仍在，cancel 后 create
+		//   - liveID == 0：旧 TP 已不在（被 modify 取消但新单未生成 / 已成交），直接 create
+		utils.Logger.Warn("Modify TP 失败，对账交易所端真实状态",
 			zap.Int64("old_tp_id", oldTPID),
 			zap.Error(modErr))
-	}
 
-	// 降级路径：取消旧 TP + 创建新 TP
-	if oldTPID != 0 {
-		utils.Logger.Info("取消旧 TP", zap.Int64("id", oldTPID))
-		if err := s.exchange.CancelOrder(oldTPID); err != nil {
-			utils.Logger.Warn("取消旧 TP 失败（可能已成交或已取消）", zap.Error(err))
+		liveID, _, _, reconcileErr := s.findLiveTP()
+		if reconcileErr != nil {
+			utils.Logger.Warn("对账查询失败，保守跳过本次更新，等下次重试",
+				zap.Error(reconcileErr))
+			return
+		}
+
+		if liveID != 0 && liveID != oldTPID {
+			// modify 网络失败但交易所端已成功，新 TP 已存在 → 只同步本地状态，不重复 create
+			s.mu.Lock()
+			if s.currentState == StateIdle {
+				s.mu.Unlock()
+				utils.Logger.Info("Modify 网络失败但交易所端已成功，周期已结束，取消新 TP",
+					zap.Int64("old_tp_id", oldTPID),
+					zap.Int64("new_tp_id", liveID))
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							utils.Logger.Error("取消 TP goroutine panic", zap.Any("recover", r))
+						}
+					}()
+					s.exchange.CancelOrder(liveID)
+				}()
+				return
+			}
+			s.currentTPOrderID = liveID
+			s.lastTPQty = newQty
+			s.lastTPPrice = tpPrice
+			s.mu.Unlock()
+			utils.Logger.Info("Modify 网络失败但交易所端已成功，同步本地状态，跳过 create",
+				zap.Int64("old_tp_id", oldTPID),
+				zap.Int64("new_tp_id", liveID),
+				zap.Float64("qty", newQty),
+				zap.Float64("price", tpPrice))
+			return
+		}
+
+		// liveID == oldTPID（旧 TP 仍在）或 liveID == 0（旧 TP 已不在）
+		// 走降级 cancel + create，但只在旧 TP 确实还在时才 cancel，避免对已不存在的订单 cancel
+		if liveID == oldTPID && oldTPID != 0 {
+			utils.Logger.Info("旧 TP 确实仍在，取消后重建", zap.Int64("id", oldTPID))
+			if err := s.exchange.CancelOrder(oldTPID); err != nil {
+				utils.Logger.Warn("取消旧 TP 失败（可能已成交或已取消）", zap.Error(err))
+			}
+		} else {
+			utils.Logger.Info("旧 TP 已不在交易所端，跳过 cancel 直接 create",
+				zap.Int64("old_tp_id", oldTPID),
+				zap.Int64("live_tp_id", liveID))
 		}
 	}
 
