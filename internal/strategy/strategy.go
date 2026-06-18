@@ -908,7 +908,8 @@ func (s *MartingaleStrategy) placeGridOrders() {
 		return
 	}
 
-	// 预计算各周期 ATR（9 级网格：1h/2h/4h/8h/12h/1d/3d/1w/1M）
+	// 预计算各周期 ATR（9 级网格：30m/1h/2h/4h/8h/12h/1d/3d/1w）
+	atr30m := s.fetchATR("30m")
 	atr1h := s.fetchATR("1h")
 	atr2h := s.fetchATR("2h")
 	atr4h := s.fetchATR("4h")
@@ -917,8 +918,10 @@ func (s *MartingaleStrategy) placeGridOrders() {
 	atr1d := s.fetchATR("1d")
 	atr3d := s.fetchATR("3d")
 	atr1w := s.fetchATR("1w")
-	atr1M := s.fetchATR("1M")
 
+	if atr30m == 0 {
+		atr30m = entryPrice * 0.01
+	}
 	if atr1h == 0 {
 		atr1h = entryPrice * 0.01
 	}
@@ -943,9 +946,6 @@ func (s *MartingaleStrategy) placeGridOrders() {
 	if atr1w == 0 {
 		atr1w = entryPrice * 0.01
 	}
-	if atr1M == 0 {
-		atr1M = entryPrice * 0.01
-	}
 
 	minNotional := s.calcMinNotional()
 	// ★ 审计修复：数量使用 FloorToTickSize 向下取整
@@ -953,10 +953,10 @@ func (s *MartingaleStrategy) placeGridOrders() {
 
 	utils.Logger.Info("放置网格订单",
 		zap.Float64("Entry", entryPrice),
-		zap.Float64("ATR1h", atr1h),
+		zap.Float64("ATR30m", atr30m),
 		zap.Float64("UnitQty", unitQty))
 
-	gridDistances := []float64{atr1h, atr2h, atr4h, atr8h, atr12h, atr1d, atr3d, atr1w, atr1M}
+	gridDistances := []float64{atr30m, atr1h, atr2h, atr4h, atr8h, atr12h, atr1d, atr3d, atr1w}
 
 	currentPriceLevel := entryPrice
 
