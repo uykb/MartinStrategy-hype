@@ -205,6 +205,13 @@ func (m *mockAdapter) setKlines(interval string, count int, price float64) {
 	m.mu.Unlock()
 }
 
+// getOrderCounts 线程安全地获取订单调用计数器（供并发测试使用）。
+func (m *mockAdapter) getOrderCounts() (create, modify, cancel int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.createOrderCount, m.modifyOrderCount, m.cancelOrderCount
+}
+
 // ---------------------------------------------------------------------------
 // 测试辅助函数
 // ---------------------------------------------------------------------------
@@ -725,7 +732,9 @@ func TestHandleOrderUpdate_SafetyFill_AlwaysTriggersTP(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// 验证：无论 gridPlaced 如何，安全订单成交都应触发 TP 更新
-	if adapter.modifyOrderCount == 0 && adapter.createOrderCount == 0 {
+	// ★ 使用线程安全的 getOrderCounts 避免与 goroutine 中的 ModifyOrder/CreateOrder 竞争
+	createCount, modifyCount, _ := adapter.getOrderCounts()
+	if modifyCount == 0 && createCount == 0 {
 		t.Error("安全订单成交应始终触发 TP 更新，但未调用任何订单 API")
 	}
 }
@@ -771,7 +780,9 @@ func TestHandleOrderUpdate_SafetyFill_GridPlaced_TriggersTP(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// 验证：应触发 TP 更新
-	if adapter.modifyOrderCount == 0 && adapter.createOrderCount == 0 {
+	// ★ 使用线程安全的 getOrderCounts 避免与 goroutine 中的 ModifyOrder/CreateOrder 竞争
+	createCount, modifyCount, _ := adapter.getOrderCounts()
+	if modifyCount == 0 && createCount == 0 {
 		t.Error("网格已放置时安全订单成交应触发 TP 更新，但未调用任何订单 API")
 	}
 }
