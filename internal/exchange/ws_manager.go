@@ -570,24 +570,13 @@ func (w *WSManager) resyncViaREST() {
 	utils.Logger.Info("REST 对账：挂单列表",
 		zap.Int("count", len(orders)))
 
-	// 3. 查询最近成交记录（补漏）
-	// 通过 REST 查询最近成交，防止断线期间漏掉成交
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	var pendingFills []OrderUpdate
-	fills, err := w.adapter.infoClient.UserFills(ctx, w.adapter.userFillsParams())
-	if err != nil {
-		utils.Logger.Warn("REST 对账：查询最近成交失败", zap.Error(err))
-	} else {
-		for _, fill := range fills {
-			// 将断线期间可能漏掉的成交转换为 OrderUpdate 事件
-			update := fillToOrderUpdate(fill, w.cfg.Symbol)
-			if update != nil {
-				pendingFills = append(pendingFills, *update)
-			}
-		}
-	}
+	// ★ 审计修复：不再从 REST API 补发历史成交事件。
+	// UserFills API 返回所有近期成交（跨交易周期），补发为 EventOrderUpdate
+	// 会导致 FSM 被旧成交（如历史 SELL）重置为 IDLE → CancelAllOrders 取消
+	// 所有网格订单 → 然后历史 BUY 触发重新开仓 → 无限循环。
+	//
+	// 断线期间的仓位变化通过 EventPositionUpdate → safeUpdateTP() 处理，
+	// 不需要历史成交事件。实时成交由 WebSocket 推送。
 
 	// ★ 先解冻 FSM，再发布事件，确保事件不被冻结检查丢弃
 	w.bus.Publish(core.EventResyncEnd, nil)
@@ -596,16 +585,6 @@ func (w *WSManager) resyncViaREST() {
 
 	// 发布持仓更新事件，让 FSM 校准（handlePositionUpdate 会触发 TP 校准）
 	w.bus.Publish(core.EventPositionUpdate, pos)
-
-	// 发布补漏的成交事件（FSM 已解冻，handleOrderUpdate 可正常处理）
-	for i := range pendingFills {
-		update := pendingFills[i]
-		utils.Logger.Info("REST 对账：补发漏掉的成交事件",
-			zap.Int64("oid", update.OrderID),
-			zap.String("side", string(update.Side)),
-			zap.Float64("price", update.ExecPrice))
-		w.bus.Publish(core.EventOrderUpdate, &update)
-	}
 }
 
 // fillToOrderUpdate 将 Hyperliquid Fill 转换为通用 OrderUpdate
