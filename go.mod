@@ -3,9 +3,9 @@ module github.com/uykb/MartinStrategy
 go 1.25.4
 
 require (
+	github.com/ethereum/go-ethereum v1.17.3
 	github.com/glebarez/sqlite v1.11.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/markcheno/go-talib v0.0.0-20250114000313-ec55a20c902f
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/sonirico/go-hyperliquid v0.37.0
 	github.com/spf13/viper v1.21.0
@@ -26,7 +26,6 @@ require (
 	github.com/elastic/go-sysinfo v1.15.4 // indirect
 	github.com/elastic/go-windows v1.0.2 // indirect
 	github.com/ethereum/c-kzg-4844/v2 v2.1.6 // indirect
-	github.com/ethereum/go-ethereum v1.17.3 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/glebarez/go-sqlite v1.21.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect

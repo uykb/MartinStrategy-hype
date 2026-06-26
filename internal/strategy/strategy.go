@@ -916,44 +916,11 @@ func (s *MartingaleStrategy) placeGridOrders() {
 		return
 	}
 
-	// 预计算各周期 ATR（9 级网格：30m/1h/2h/4h/8h/12h/1d/3d/1w）
-	atr30m := s.fetchATR("30m")
-	atr1h := s.fetchATR("1h")
-	atr2h := s.fetchATR("2h")
-	atr4h := s.fetchATR("4h")
-	atr8h := s.fetchATR("8h")
-	atr12h := s.fetchATR("12h")
-	atr1d := s.fetchATR("1d")
-	atr3d := s.fetchATR("3d")
-	atr1w := s.fetchATR("1w")
-
-	if atr30m == 0 {
-		atr30m = entryPrice * 0.01
-	}
-	if atr1h == 0 {
-		atr1h = entryPrice * 0.01
-	}
-	if atr2h == 0 {
-		atr2h = entryPrice * 0.01
-	}
-	if atr4h == 0 {
-		atr4h = entryPrice * 0.01
-	}
-	if atr8h == 0 {
-		atr8h = entryPrice * 0.01
-	}
-	if atr12h == 0 {
-		atr12h = entryPrice * 0.01
-	}
-	if atr1d == 0 {
-		atr1d = entryPrice * 0.01
-	}
-	if atr3d == 0 {
-		atr3d = entryPrice * 0.01
-	}
-	if atr1w == 0 {
-		atr1w = entryPrice * 0.01
-	}
+	// 固定百分比网格间距（9 层，相对上一层的下降比例）
+	// Level 1: -1.0%  Level 2: -1.0%  Level 3: -1.0%
+	// Level 4: -1.1%  Level 5: -2.1%  Level 6: -2.2%
+	// Level 7: -4.5%  Level 8: -4.8%  Level 9: -7.7%
+	gridPercents := []float64{0.010, 0.010, 0.010, 0.011, 0.021, 0.022, 0.045, 0.048, 0.077}
 
 	minNotional := s.calcMinNotional()
 	// ★ 审计修复：数量使用 FloorToTickSize 向下取整
@@ -961,10 +928,7 @@ func (s *MartingaleStrategy) placeGridOrders() {
 
 	utils.Logger.Info("放置网格订单",
 		zap.Float64("Entry", entryPrice),
-		zap.Float64("ATR30m", atr30m),
 		zap.Float64("UnitQty", unitQty))
-
-	gridDistances := []float64{atr30m, atr1h, atr2h, atr4h, atr8h, atr12h, atr1d, atr3d, atr1w}
 
 	currentPriceLevel := entryPrice
 
@@ -972,18 +936,25 @@ func (s *MartingaleStrategy) placeGridOrders() {
 	successCount := 0
 
 	for i := 1; i <= s.cfg.MaxSafetyOrders; i++ {
-		stepDist := 0.0
-		if i-1 < len(gridDistances) {
-			stepDist = gridDistances[i-1]
+		// 获取当前层的固定百分比间距（相对上一层价格的下降比例）
+		stepPct := 0.01 // 默认 1%
+		if i-1 < len(gridPercents) {
+			stepPct = gridPercents[i-1]
 		} else {
-			stepDist = gridDistances[len(gridDistances)-1]
+			stepPct = gridPercents[len(gridPercents)-1]
 		}
 
-		price := currentPriceLevel - stepDist
+		price := currentPriceLevel * (1 - stepPct)
 		currentPriceLevel = price
 
 		// ★ Hyperliquid 5 位有效数字截断
 		price = utils.RoundToSigFigs(price, 5, s.maxPriceDecimals)
+
+		utils.Logger.Info("放置安全订单",
+			zap.Int("index", i),
+			zap.Float64("price", price),
+			zap.Float64("pct", stepPct*100),
+		)
 
 		volMult := s.getGridMultiplier(i)
 		qty := unitQty * float64(volMult)
@@ -1011,13 +982,6 @@ func (s *MartingaleStrategy) placeGridOrders() {
 				zap.Float64("value", qty*price),
 				zap.Float64("min_notional", minNotional))
 		}
-
-		utils.Logger.Info("放置安全订单",
-			zap.Int("index", i),
-			zap.Float64("price", price),
-			zap.Float64("qty", qty),
-			zap.Float64("dist_atr", stepDist),
-		)
 
 		// ★ P1 加固：带重试的下单逻辑（3次重试 + 抖动退避）
 		if s.placeOrderWithRetry(exchange.OrderSideBuy, exchange.OrderTypeLimit, qty, price, i) {
@@ -1223,18 +1187,13 @@ func (s *MartingaleStrategy) updateTP() {
 		zap.Float64("new_qty", newQty),
 		zap.Int64("old_tp_id", oldTPID))
 
-	// ★ 仓位已变化 → 重新获取止盈位置（网络请求在锁外执行）
-	atr30m := s.fetchATR("30m")
-	if atr30m == 0 {
-		atr30m = pos.EntryPrice * 0.01
-	}
-
-	tpPrice := utils.RoundToSigFigs(pos.EntryPrice+atr30m, 5, s.maxPriceDecimals)
+	// ★ 固定百分比止盈：持仓均价 +0.80%
+	tpPrice := utils.RoundToSigFigs(pos.EntryPrice*1.008, 5, s.maxPriceDecimals)
 
 	utils.Logger.Info("计算新 TP",
 		zap.Float64("entry_price", pos.EntryPrice),
-		zap.Float64("atr30m", atr30m),
 		zap.Float64("tp_price", tpPrice),
+		zap.Float64("tp_pct", 0.80),
 		zap.Float64("tp_qty", newQty))
 
 	// ★ 优先使用 ModifyOrder 原子替换（避免取消+重建的空窗期）
@@ -1365,29 +1324,6 @@ func (s *MartingaleStrategy) updateTP() {
 // ---------------------------------------------------------------------------
 // 辅助方法
 // ---------------------------------------------------------------------------
-
-// fetchATR 获取指定周期的 ATR 值
-func (s *MartingaleStrategy) fetchATR(interval string) float64 {
-	utils.Logger.Info("fetchATR 调用", zap.String("interval", interval))
-
-	candles, err := s.exchange.GetKlines(interval, 50)
-	if err != nil {
-		utils.Logger.Error("获取 K 线数据失败", zap.String("interval", interval), zap.Error(err))
-		return 0
-	}
-	utils.Logger.Info("fetchATR 获取到 K 线数据",
-		zap.String("interval", interval),
-		zap.Int("count", len(candles)))
-
-	var highs, lows, closes []float64
-	for _, k := range candles {
-		highs = append(highs, k.High)
-		lows = append(lows, k.Low)
-		closes = append(closes, k.Close)
-	}
-
-	return utils.CalculateATR(highs, lows, closes, s.cfg.AtrPeriod)
-}
 
 // calcMinNotional 动态计算最低下单金额
 func (s *MartingaleStrategy) calcMinNotional() float64 {
