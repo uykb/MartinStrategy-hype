@@ -108,6 +108,12 @@ type MartingaleStrategy struct {
 	// 推送可能持续数秒且顺序错乱（如先推 SELL 再推 BUY）。
 	// 时间窗口不可靠，改用标志位：syncState + 3s 延迟后才允许处理成交事件。
 	initialSyncDone atomic.Bool
+
+	// 入场单跟踪：用于等待 GTC 限价单完全成交后再放置网格。
+	// entryOrderID = 0 表示无活动入场单。
+	entryOrderID          int64   // 当前入场单的订单 ID
+	entrySubmittedQty     float64 // 入场单提交的数量
+	entryCumulativeFilled float64 // 入场单累计已成交数量
 }
 
 // NewMartingaleStrategy 创建策略实例
@@ -230,6 +236,9 @@ func (s *MartingaleStrategy) monitorPositionStatus() {
 				s.lastTPPrice = 0
 				s.position = nil
 				s.activeOrders = make(map[int64]*exchange.OpenOrder)
+				s.entryOrderID = 0
+				s.entrySubmittedQty = 0
+				s.entryCumulativeFilled = 0
 				s.mu.Unlock()
 
 				s.exchange.CancelAllOrders()
@@ -358,6 +367,9 @@ func (s *MartingaleStrategy) syncState() {
 		s.lastTPPrice = 0
 		s.position = nil
 		s.activeOrders = make(map[int64]*exchange.OpenOrder)
+		s.entryOrderID = 0
+		s.entrySubmittedQty = 0
+		s.entryCumulativeFilled = 0
 		s.mu.Unlock()
 		utils.Logger.Info("状态同步：无持仓", zap.String("state", string(s.currentState)))
 	}
@@ -461,15 +473,18 @@ func (s *MartingaleStrategy) waitForFillAndPlaceGrid() {
 	for {
 		select {
 		case <-s.ctx.Done():
+			s.cancelEntryOrder()
 			return
 		case <-s.waitStopCh:
 			utils.Logger.Info("waitForFillAndPlaceGrid: 通过 channel 停止")
+			s.cancelEntryOrder()
 			return
 		case <-timeout:
 			utils.Logger.Warn("waitForFillAndPlaceGrid: 超时，未检测到持仓")
 			s.mu.Lock()
 			s.currentState = StateIdle
 			s.mu.Unlock()
+			s.cancelEntryOrder()
 			return
 		case <-ticker.C:
 			s.mu.RLock()
@@ -479,6 +494,7 @@ func (s *MartingaleStrategy) waitForFillAndPlaceGrid() {
 			if state != StatePlacingGrid {
 				utils.Logger.Info("waitForFillAndPlaceGrid: 状态已变更，中止",
 					zap.String("state", string(state)))
+				s.cancelEntryOrder()
 				return
 			}
 
@@ -492,6 +508,11 @@ func (s *MartingaleStrategy) waitForFillAndPlaceGrid() {
 				utils.Logger.Info("检测到持仓，开始放置网格订单",
 					zap.Float64("size", pos.Size),
 					zap.Float64("entry_price", pos.EntryPrice))
+				s.mu.Lock()
+				s.entryOrderID = 0
+				s.entrySubmittedQty = 0
+				s.entryCumulativeFilled = 0
+				s.mu.Unlock()
 				s.placeGridOrders()
 				return
 			}
@@ -545,7 +566,43 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 		if order.Side == exchange.OrderSideBuy {
 			utils.Logger.Info("买单成交",
 				zap.String("type", string(order.Type)),
-				zap.Float64("execPrice", order.ExecPrice))
+				zap.Float64("execPrice", order.ExecPrice),
+				zap.Float64("qty", order.Quantity),
+				zap.Int64("order_id", order.OrderID))
+
+			// 判断是否为入场单（匹配 entryOrderID）
+			isEntry := s.entryOrderID != 0 && order.OrderID == s.entryOrderID
+
+			if isEntry {
+				// 累加入场单已成交数量
+				s.mu.Lock()
+				s.entryCumulativeFilled += order.Quantity
+				filled := s.entryCumulativeFilled
+				submitted := s.entrySubmittedQty
+				s.mu.Unlock()
+
+				utils.Logger.Info("入场单成交更新",
+					zap.Int64("order_id", order.OrderID),
+					zap.Float64("filled_qty", order.Quantity),
+					zap.Float64("cumulative", filled),
+					zap.Float64("submitted", submitted),
+				)
+
+				// 只有完全成交（≥99.9%）才触发网格放置
+				if filled >= submitted*0.999 {
+					utils.Logger.Info("入场单完全成交，放置网格",
+						zap.Float64("cumulative", filled),
+						zap.Float64("submitted", submitted))
+					s.mu.Lock()
+					s.currentState = StateInPosition
+					s.entryOrderID = 0
+					s.entrySubmittedQty = 0
+					s.entryCumulativeFilled = 0
+					s.mu.Unlock()
+					go s.safePlaceGridOrders()
+				}
+				return nil
+			}
 
 			s.mu.Lock()
 			prevState := s.currentState
@@ -560,12 +617,18 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 					utils.Logger.Info("基础订单成交，放置网格订单", zap.Float64("execPrice", order.ExecPrice))
 					s.mu.Lock()
 					s.currentState = StateInPosition
+					s.entryOrderID = 0
+					s.entrySubmittedQty = 0
+					s.entryCumulativeFilled = 0
 					s.mu.Unlock()
 					go s.safePlaceGridOrders()
 				} else {
 					utils.Logger.Info("基础订单成交但网格已放置，更新 TP", zap.Float64("execPrice", order.ExecPrice))
 					s.mu.Lock()
 					s.currentState = StateInPosition
+					s.entryOrderID = 0
+					s.entrySubmittedQty = 0
+					s.entryCumulativeFilled = 0
 					s.mu.Unlock()
 					go s.safeUpdateTP()
 				}
@@ -591,6 +654,9 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 			s.lastTPPrice = 0
 			s.position = nil
 			s.activeOrders = make(map[int64]*exchange.OpenOrder)
+			s.entryOrderID = 0
+			s.entrySubmittedQty = 0
+			s.entryCumulativeFilled = 0
 			utils.Logger.Info("卖单成交：状态重置为 IDLE", zap.Bool("gridPlaced", s.gridPlaced))
 			s.mu.Unlock()
 
@@ -668,6 +734,9 @@ func (s *MartingaleStrategy) handlePositionUpdate(ctx context.Context, event cor
 			s.lastTPPrice = 0
 			s.position = nil
 			s.activeOrders = make(map[int64]*exchange.OpenOrder)
+			s.entryOrderID = 0
+			s.entrySubmittedQty = 0
+			s.entryCumulativeFilled = 0
 			s.mu.Unlock()
 			s.exchange.CancelAllOrders()
 		}
@@ -783,13 +852,12 @@ func (s *MartingaleStrategy) safeUpdateTP() {
 // 策略动作
 // ---------------------------------------------------------------------------
 
-// enterLong 入场做多
+// enterLong 入场做多（GTC 限价单，挂单成交以节约手续费）。
 func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
-	utils.Logger.Info("正在入场做多...")
+	utils.Logger.Info("正在入场做多（限价挂单）...")
 
 	minNotional := s.calcMinNotional()
 	unitQtyRaw := minNotional / currentPrice
-	// ★ 审计修复：数量使用 Floor 截断，防止向上取整导致余额不足
 	unitQty := utils.FloorToTickSize(unitQtyRaw, s.stepSize)
 
 	if unitQty < s.minQty {
@@ -797,11 +865,8 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 	}
 
 	baseQty := unitQty * 0.06
-	// ★ 审计修复：数量使用 FloorToDecimals 向下取整，杜绝四舍五入
 	baseQty = utils.FloorToDecimals(baseQty, s.quantityPrecision)
 
-	// ★ 运行时修复：Floor 截断后金额可能略低于 MinNotional（如 9.44 < 10），
-	// 需要向上微调一个 stepSize 确保满足交易所最低金额要求。
 	if baseQty*currentPrice < minNotional {
 		baseQty = utils.FloorToDecimals(baseQty+s.stepSize, s.quantityPrecision)
 		utils.Logger.Info("金额不足，微调数量",
@@ -810,18 +875,32 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 			zap.Float64("min_notional", minNotional))
 	}
 
-	utils.Logger.Info("计算基础下单量",
+	// GTC 限价单：1% 溢价确保较快成交，但远低于原 5% IOC 溢价。
+	limitPrice := utils.RoundToSigFigs(currentPrice*1.01, 5, s.maxPriceDecimals)
+
+	utils.Logger.Info("计算入场下单量",
 		zap.Float64("price", currentPrice),
+		zap.Float64("limit_price", limitPrice),
 		zap.Float64("unit_qty", unitQty),
 		zap.Float64("base_qty", baseQty),
 		zap.Float64("value", baseQty*currentPrice),
 	)
 
-	_, err := s.exchange.CreateOrder(exchange.OrderSideBuy, exchange.OrderTypeMarket, baseQty, currentPrice)
+	resp, err := s.exchange.CreateOrder(exchange.OrderSideBuy, exchange.OrderTypeLimit, baseQty, limitPrice)
 	if err != nil {
-		utils.Logger.Error("基础订单下单失败", zap.Error(err))
+		utils.Logger.Error("入场限价单下单失败", zap.Error(err))
 		return err
 	}
+
+	// 跟踪入场单 ID 和期望数量，用于等待完全成交
+	s.entryOrderID = resp.OrderID
+	s.entrySubmittedQty = baseQty
+	s.entryCumulativeFilled = 0
+	utils.Logger.Info("入场限价单已提交",
+		zap.Int64("order_id", s.entryOrderID),
+		zap.Float64("submitted_qty", s.entrySubmittedQty),
+		zap.Float64("limit_price", limitPrice),
+	)
 
 	return nil
 }
@@ -1324,6 +1403,24 @@ func (s *MartingaleStrategy) updateTP() {
 // ---------------------------------------------------------------------------
 // 辅助方法
 // ---------------------------------------------------------------------------
+
+// cancelEntryOrder 取消当前入场单（如果存在），清理跟踪状态。
+// 幂等安全：entryOrderID == 0 时直接返回。
+func (s *MartingaleStrategy) cancelEntryOrder() {
+	oid := s.entryOrderID
+	if oid == 0 {
+		return
+	}
+	utils.Logger.Info("取消未成交的入场限价单", zap.Int64("order_id", oid))
+	if err := s.exchange.CancelOrder(oid); err != nil {
+		utils.Logger.Warn("取消入场单失败（可能已成交）",
+			zap.Int64("order_id", oid),
+			zap.Error(err))
+	}
+	s.entryOrderID = 0
+	s.entrySubmittedQty = 0
+	s.entryCumulativeFilled = 0
+}
 
 // calcMinNotional 动态计算最低下单金额
 func (s *MartingaleStrategy) calcMinNotional() float64 {

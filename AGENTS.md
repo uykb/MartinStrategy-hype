@@ -140,6 +140,7 @@ if err := doNetworkCall(); err != nil {
 | WS reconnect | 10 retries | Exponential backoff (2s initial, 60s max) |
 | WS initial sync delay | 3s | Wait after syncState before processing fills |
 | Resync thaw delay | 2s | Delay after ResyncEnd before unfreezing FSM |
+| Entry order timeout | 30s | Max wait for limit order fill before cancelling and resetting |
 | Entry order timeout | 30s | Max wait for market order fill before resetting |
 
 ## Key Config Parameters
@@ -265,18 +266,25 @@ func (s *MartingaleStrategy) calcMinNotional() float64 {
 IDLE → PriceUpdate Tick (fresh, ≤2s old)
   → state = PLACING_GRID
   → enterLong(price):
-      1. calcMinNotional() → unitQty → baseQty
-      2. CreateOrder(MARKET BUY, baseQty)
+      1. calcMinNotional() → unitQty → baseQty (×0.06)
+      2. limitPrice = RoundToSigFigs(price × 1.01, 5, maxPriceDecimals)  // 1% 溢价
+      3. CreateOrder(LIMIT BUY GTC, baseQty, limitPrice)                 // 挂单成交
+      4. Save entryOrderID + entrySubmittedQty for fill tracking
   → waitForFillAndPlaceGrid() [goroutine, polls 2s interval, 30s timeout]
-       → placeGridOrders():
+       → On timeout / state change: cancelEntryOrder() + reset to IDLE
+  → handleOrderUpdate FILLED (matches entryOrderID):
+      1. Accumulate entryCumulativeFilled += order.Quantity
+      2. When cumulativeFilled ≥ submittedQty × 0.999 → fully filled
+      3. Set state = StateInPosition, clear entry tracking
+      4. → safePlaceGridOrders() → placeGridOrders():
            1. Check grid completeness via GetOpenOrders()
-              - If grid intact, set gridPlaced=true, return
-              - If grid incomplete, cancel existing buy orders, re-place
+              - If grid intact (gridCount ≥ MaxSafetyOrders), gridPlaced=true, return
+              - If incomplete, cancel existing buy orders, re-place
            2. calcMinNotional() → unitQty
            3. For level 1..MaxSafetyOrders:
-              price = prevLevelPrice * (1 - stepPct), RoundToSigFigs
-              qty = unitQty * getGridMultiplier(i), FloorToTickSize, FloorToDecimals
-              placeOrderWithRetry(LIMIT BUY, 3 retries, jitter backoff)
+              price = prevLevelPrice × (1 - stepPct), RoundToSigFigs
+              qty = unitQty × getGridMultiplier(i), FloorToTickSize, FloorToDecimals
+              placeOrderWithRetry(LIMIT BUY GTC, 3 retries, jitter backoff)
               200ms rate limit delay
            4. If all placed, gridPlaced=true
        → safeUpdateTP()
@@ -293,7 +301,8 @@ Three hard constraints:
 
 All order prices go through `RoundToSigFigs(price, 5, maxPriceDecimals)` before submit.
 
-Market orders (simulated via IOC limit): BUY at `price × 1.05`, SELL at `price × 0.95`.
+Entry orders use LIMIT GTC at `price × 1.01` (1% above market, maker-friendly).
+Grid orders use LIMIT GTC at calculated grid prices.
 
 ## Stale Price Protection
 

@@ -1,8 +1,8 @@
 // Package exchange 提供 WebSocket 连接管理器，实现三层稳定性防线：
 //
-//   第一层：主动心跳 —— 每 30 秒发送 ping，超时判定假死
-//   第二层：断线重连 + 指数退避 —— 网络中断时自动重连
-//   第三层：REST 对账 (Resync) —— 重连后强制查询持仓与挂单，校准 FSM
+//	第一层：主动心跳 —— 每 30 秒发送 ping，超时判定假死
+//	第二层：断线重连 + 指数退避 —— 网络中断时自动重连
+//	第三层：REST 对账 (Resync) —— 重连后强制查询持仓与挂单，校准 FSM
 //
 // 同时管理公有流（l2Book / trades → EventTick）与私有流
 // （userFills / orderUpdates → EventOrderUpdate）的双通道订阅。
