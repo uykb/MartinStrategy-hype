@@ -11,7 +11,7 @@ go test ./...
 
 # Run single test (example pattern)
 go test -run TestFunctionName ./internal/utils/...
-go test -v -run TestCalculateATR ./internal/utils/
+go test -v -run TestRoundToSigFigs ./internal/utils/
 
 # Code checks
 go vet ./...
@@ -64,7 +64,7 @@ import (
 - **Unexported**: camelCase (e.g., `currentState`, `handleTick`)
 - **Constants**: PascalCase for exported, camelCase for unexported (e.g., `StateIdle`, `minNotional`)
 - **Interfaces**: `-er` suffix (e.g., `EventHandler`)
-- **Acronyms**: Keep uppercase (e.g., `ATR`, `TP`, `API`)
+- **Acronyms**: Keep uppercase (e.g., `TP`, `API`)
 - Event type constants: `Event` prefix (e.g., `EventTick`, `EventOrderUpdate`)
 
 ### Error Handling
@@ -99,6 +99,9 @@ if err := doNetworkCall(); err != nil {
     s.mu.Unlock()
 }
 ```
+- All long-running goroutines must have `defer recover()` + 5s self-healing restart
+- Use `atomic.Bool` for cross-goroutine flags (frozen, tpDirty, initialSyncDone)
+- Use context cancellation for goroutine lifecycle control
 
 ### Configuration
 - Environment variables use `MARTIN_` prefix (e.g., `MARTIN_EXCHANGE_API_KEY`)
@@ -114,82 +117,129 @@ if err := doNetworkCall(); err != nil {
 
 | Package | Purpose |
 |---------|---------|
-| `internal/config` | Viper-based config loading from YAML/env |
-| `internal/core` | Event bus with Pub/Sub pattern |
+| `internal/config` | Viper-based config loading from YAML/env (prefix `MARTIN_`) |
+| `internal/core` | Event bus with Pub/Sub pattern, buffer 1000 |
 | `internal/exchange` | Hyperliquid WebSocket + REST adapter (ExchangeAdapter interface) |
 | `internal/strategy` | Martingale FSM (states: IDLE → PLACING_GRID → IN_POSITION) |
 | `internal/storage` | GORM + SQLite, Redis for locking |
-| `internal/utils` | Indicators (ATR), rounding, Zap logger |
+| `internal/utils` | Price rounding (5 sig figs, Floor truncation), Zap logger |
 
 ## Key Constants
-- `MinOrderValue = 10.0` - Minimum USDC order value for Hyperliquid Perps (动态头仓下限)
-- Event queue buffer: 1000
-- Grid levels: 9 max (1h/2h/4h/8h/12h/1d/3d/1w/1M)
-- Quantity scaling: 首仓=1x, 加仓1=0.5x, 加仓2=0.5x, 加仓3=1x, 加仓4=1x, then Fibonacci (2,3,5,8...)
-- Price polling interval: 10s
-- Position monitor interval: 5s
-- Grid order API rate limit: 200ms between orders
-- WebSocket heartbeat: 30s ping interval, 10s pong timeout
-- WebSocket reconnect: up to 10 retries with exponential backoff (2s initial, 60s max)
-- REST resync on reconnect: query position + open orders + recent fills
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MinOrderValue` | 10.0 | Minimum USDC order value (动态头仓下限) |
+| `MaxTickStaleness` | 2s | Max allowed price age; stale ticks are dropped (防滑点) |
+| Price polling interval | 10s | REST fallback when WS is down |
+| Position monitor interval | 5s | Monitor position zero → auto reset to IDLE |
+| Grid order rate limit | 200ms | Delay between each grid order placement |
+| Grid order retries | 3 | Per-level retry with jitter exponential backoff |
+| TP dirty retries | 3 | Max retries for dirty TP loop (liveness guard) |
+| WS ping interval | 30s | Heartbeat ping |
+| WS pong timeout | 10s | Heartbeat pong wait |
+| WS reconnect | 10 retries | Exponential backoff (2s initial, 60s max) |
+| WS initial sync delay | 3s | Wait after syncState before processing fills |
+| Resync thaw delay | 2s | Delay after ResyncEnd before unfreezing FSM |
+| Entry order timeout | 30s | Max wait for market order fill before resetting |
 
 ## Key Config Parameters
-- `base_ratio: 0.05` - 头仓金额 = 账户 USDC 余额 × base_ratio（动态计算，每次开仓前实时查询）
-- `max_safety_orders: 9` - 最大网格层数
-- `atr_period: 14` - ATR 计算周期
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `base_ratio` | 0.05 | 头仓金额 = 账户 USDC 余额 × base_ratio（动态计算，每次实时查询） |
+| `max_safety_orders` | 9 | 最大网格层数 |
+| `atr_period` | 14 | **未使用**（保留但策略中无 ATR 计算） |
 
 ## Grid Strategy Details
 
-### ATR Grid Distances (9 Levels)
+### Grid Price Distances (Fixed Percentage)
 
-| Level | Timeframe | ATR Source | Description |
-|-------|-----------|------------|-------------|
-| 1 | 1h | `fetchATR("1h")` | 首层保护 |
-| 2 | 2h | `fetchATR("2h")` | 第二层保护 |
-| 3 | 4h | `fetchATR("4h")` | 中短期保护 |
-| 4 | 8h | `fetchATR("8h")` | 中期保护 |
-| 5 | 12h | `fetchATR("12h")` | 中长期保护 |
-| 6 | 1d | `fetchATR("1d")` | 长期保护 |
-| 7 | 3d | `fetchATR("3d")` | 长期保护 |
-| 8 | 1w | `fetchATR("1w")` | 超长期保护 |
-| 9 | 1M | `fetchATR("1M")` | 最深层保护 |
+网格间距是**固定百分比**，相对于**前一层**价格（非入口价）：
 
-- Distances are **relative to previous order**, not absolute
-- ATR fetch failure fallback: `entryPrice * 0.01`
-- Beyond level 9, fallback to last defined distance (ATR(1M))
+```
+gridPercents := []float64{0.010, 0.010, 0.010, 0.011, 0.021, 0.022, 0.045, 0.048, 0.077}
+```
 
-### Quantity Scaling (getGridMultiplier)
+| Level | Drop % | Cumulative Drop | Description |
+|-------|--------|----------------|-------------|
+| 1 | -1.0% | -1.0% | 首层保护 |
+| 2 | -1.0% | -2.0% | 第二层保护 |
+| 3 | -1.0% | -3.0% | 第三层保护 |
+| 4 | -1.1% | -4.0% | 第四层保护 |
+| 5 | -2.1% | -6.0% | 第五层保护 |
+| 6 | -2.2% | -8.1% | 第六层保护 |
+| 7 | -4.5% | -12.3% | 第七层保护 |
+| 8 | -4.8% | -16.5% | 第八层保护 |
+| 9 | -7.7% | -22.9% | 最深层保护 |
 
-首仓 = base_ratio，前两次加仓使用半仓，从第三次起斐波那契递增：
+- Each level price = `previousLevelPrice × (1 - stepPct)`
+- All prices truncated to **5 significant figures** via `RoundToSigFigs(price, 5, maxPriceDecimals)`
+- Beyond level 9, fallback to last array element (0.077 = 7.7%)
+- 无 ATR 依赖：无需 fallback，纯硬编码百分比
+
+### Position Sizing
+
+首仓和加仓使用固定倍数，乘以 `unitQty`（`balance × base_ratio / price`）得到实际下单数量。
+
+| 仓位 | 倍数 | 有效余额占比 |
+|------|------|------------|
+| 首仓 | 0.06 | balance × base_ratio × 0.06 |
+| 加仓1 | 0.03 | balance × base_ratio × 0.03 |
+| 加仓2 | 0.03 | balance × base_ratio × 0.03 |
+| 加仓3 | 0.05 | balance × base_ratio × 0.05 |
+| 加仓4 | 0.05 | balance × base_ratio × 0.05 |
+| 加仓5 | 0.18 | balance × base_ratio × 0.18 |
+| 加仓6 | 0.32 | balance × base_ratio × 0.32 |
+| 加仓7 | 0.567 | balance × base_ratio × 0.567 |
+| 加仓8 | 0.578 | balance × base_ratio × 0.578 |
+| 加仓9 | 1.16 | balance × base_ratio × 1.16 |
+
+首仓在 `enterLong()` 中硬编码为 `0.06`，不通过 `getGridMultiplier`。加仓层通过 `getGridMultiplier(level)` 查表，level > 9 向下取最后一层 `1.16`。
+
+### Quantity Flooring Rules
+
+All order quantities use **strict floor truncation** to prevent insufficient balance:
 
 ```go
-func (s *MartingaleStrategy) getGridMultiplier(level int) float64 {
-    switch level {
-    case 1: return 1.0   // 首仓
-    case 2: return 0.5   // 第一次加仓（半仓）
-    case 3: return 0.5   // 第二次加仓（半仓）
-    case 4: return 1.0   // 第三次加仓
-    case 5: return 1.0   // 第四次加仓
-    default:
-        // 斐波那契递增：level 6→2.0, 7→3.0, 8→5.0, 9→8.0
-        a, b := 1.0, 1.0
-        for i := 6; i <= level; i++ { a, b = b, a+b }
-        return b
-    }
+qty = FloorToTickSize(qty, stepSize)       // Floor to tickSize multiple
+qty = FloorToDecimals(qty, quantityPrecision) // Floor to decimal precision
+```
+
+Both functions add a small epsilon (`+0.00000001`) before floor to counter IEEE 754 floating point tail errors (e.g., `2.53` stored as `2.529999...`).
+
+If floor-truncated value falls below `MinNotional`, quantity is bumped by one `stepSize`:
+
+```go
+if qty * price < minNotional {
+    qty = FloorToDecimals(qty + stepSize, quantityPrecision)
 }
 ```
 
-Generates: 1.0, 0.5, 0.5, 1.0, 1.0, 2.0, 3.0, 5.0, 8.0 for levels 1-9.
-
 ### Take Profit (TP)
 
-- TP price: `avgPrice + ATR(30m)` (always uses 30-minute ATR)
-- TP quantity: full position close
-- Updated after each safety order fill
+- **TP price**: `RoundToSigFigs(entryPrice * 1.008, 5, maxPriceDecimals)` — fixed **+0.80%** markup
+- **TP quantity**: `FloorToDecimals(abs(pos.Size), quantityPrecision)` — full position close, floor truncated to prevent residual phantom position
+- **Updated after**: each safety order fill, grid placement, position update event, or restart
+
+#### TP Update Flow (strategy.go:1100-1322)
+
+1. If position size is zero → clear TP state, return
+2. **Entry reconciliation**: if `currentTPOrderID == 0`, call `findLiveTP()` to claim any existing TP on exchange (prevents duplicate create on restart)
+3. **Change detection**: if `newQty == prevQty && oldTPID != 0` → skip (no ATR fetch, no TP modify)
+4. **Modify priority**: if `oldTPID != 0`, try `ModifyOrder()` first (atomic cancel+place, no protection gap)
+5. **Modify failure reconciliation**: if modify fails, query exchange real state via `findLiveTP()`:
+   - `liveID != oldTPID` → modify actually succeeded server-side, just sync local state
+   - `liveID == oldTPID` → modify truly failed, cancel old + create new
+   - `liveID == 0` → old TP gone, skip cancel and create directly
+6. **Create fallback**: if no existing TP, create new limit sell order
+
+#### Concurrency Safety (safeUpdateTP)
+
+- Uses `tpMu.TryLock()` pattern — if another update is in flight, sets `tpDirty` flag and returns
+- Current holder checks `tpDirty` after completion, re-runs up to `maxTPDirtyRetries` (3) times
+- Prevents goroutine pile-up in high-frequency fill scenarios
 
 ## Dynamic Notional Calculation
-
-头仓金额通过 `calcMinNotional()` 动态计算：
 
 ```go
 func (s *MartingaleStrategy) calcMinNotional() float64 {
@@ -205,9 +255,70 @@ func (s *MartingaleStrategy) calcMinNotional() float64 {
 }
 ```
 
-- 调用时机：`enterLong()` 和 `placeGridOrders()` 各调用一次，同一轮下单内缓存结果
-- `enterLong` 中计算 `unitQty = calcMinNotional() / currentPrice`
-- `placeGridOrders` 中计算 `unitQty = calcMinNotional() / entryPrice`，循环内按 `getGridMultiplier(i)` 缩放
+- 每次 `enterLong()` 和 `placeGridOrders()` 各独立调用一次，不缓存（每次实时查询余额）
+- `enterLong` 中 `unitQty = calcMinNotional() / currentPrice` → `baseQty = unitQty * 1.0`
+- `placeGridOrders` 中 `unitQty = calcMinNotional() / entryPrice`，循环内按 `getGridMultiplier(i)` 缩放
+
+## Entry & Grid Placement Flow
+
+```
+IDLE → PriceUpdate Tick (fresh, ≤2s old)
+  → state = PLACING_GRID
+  → enterLong(price):
+      1. calcMinNotional() → unitQty → baseQty
+      2. CreateOrder(MARKET BUY, baseQty)
+  → waitForFillAndPlaceGrid() [goroutine, polls 2s interval, 30s timeout]
+       → placeGridOrders():
+           1. Check grid completeness via GetOpenOrders()
+              - If grid intact, set gridPlaced=true, return
+              - If grid incomplete, cancel existing buy orders, re-place
+           2. calcMinNotional() → unitQty
+           3. For level 1..MaxSafetyOrders:
+              price = prevLevelPrice * (1 - stepPct), RoundToSigFigs
+              qty = unitQty * getGridMultiplier(i), FloorToTickSize, FloorToDecimals
+              placeOrderWithRetry(LIMIT BUY, 3 retries, jitter backoff)
+              200ms rate limit delay
+           4. If all placed, gridPlaced=true
+       → safeUpdateTP()
+```
+
+## Price Precision (Hyperliquid Rules)
+
+File: `internal/utils/price_rounder.go`
+
+Three hard constraints:
+1. **5 significant figures max**: e.g., `102.345` ✓, `102.3456` ✗
+2. **Max (6 - szDecimals) decimal places**: perps MAX_DECIMALS=6
+3. **Integer prices always valid**: e.g., `100000` ✓
+
+All order prices go through `RoundToSigFigs(price, 5, maxPriceDecimals)` before submit.
+
+Market orders (simulated via IOC limit): BUY at `price × 1.05`, SELL at `price × 0.95`.
+
+## Stale Price Protection
+
+- `PriceUpdate` carries server timestamp (ms)
+- `IsStale(maxLatency)` checks `time.Since(eventTime) > maxLatency`
+- Ticks older than 2 seconds are dropped (`strategy.go:386`)
+- Prevents FSM from entering on stale prices during WS reconnect or latency spikes
+
+## FSM Freeze During Reconciliation
+
+- `EventResyncStart` → `frozen.Store(true)` — all ticks and order updates discarded
+- `EventResyncEnd` → `go sleep(2s) then frozen.Store(false)` — delay allows WS history event drain
+- Prevents websocket reconnect history events from corrupting FSM state
+
+## Initial Sync Protection
+
+- `syncState()` runs on Start, sets `initialSyncDone` after 3s delay
+- All `OrderUpdate` FILLED events before `initialSyncDone` are discarded
+- Prevents historical fill events (pushed async by WS after reconnect) from triggering false FSM transitions
+
+## REST Price Fallback
+
+When WebSocket is down, REST API polls every 10s and publishes ticks with local timestamps:
+- `restPriceFallback()` goroutine in `internal/exchange/hyperliquid.go:737-770`
+- Skips when WS is active to avoid duplicate price events
 
 ## Adding Features
 
