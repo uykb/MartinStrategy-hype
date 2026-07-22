@@ -542,6 +542,15 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 			return nil
 		}
 
+		// ★ 修复：跳过无方向的成交事件（来自 userFills 频道）。
+		// userFills 的 Side 是吃单方方向，不是我方订单方向，已在 WSManager 中留空。
+		// orderUpdates 频道提供正确的订单方向，由它负责触发状态转移。
+		if order.Side == "" {
+			utils.Logger.Debug("userFills 成交事件（无方向信息，由 orderUpdates 处理状态转移）",
+				zap.Int64("id", order.OrderID))
+			return nil
+		}
+
 		if order.Side == exchange.OrderSideBuy {
 			utils.Logger.Info("买单成交",
 				zap.String("type", string(order.Type)),
@@ -594,8 +603,17 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 			utils.Logger.Info("卖单成交：状态重置为 IDLE", zap.Bool("gridPlaced", s.gridPlaced))
 			s.mu.Unlock()
 
-			s.exchange.CancelAllOrders()
-			utils.Logger.Info("卖单成交后已取消所有挂单")
+			// ★ 修复：异步执行 CancelAllOrders，避免同步阻塞 EventBus 事件处理循环
+			// （撤销 9 层网格约需 900ms，期间所有 Tick 和订单事件排队积压）
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						utils.Logger.Error("CancelAllOrders (SELL HANDLER) panic", zap.Any("recover", r))
+					}
+				}()
+				s.exchange.CancelAllOrders()
+				utils.Logger.Info("卖单成交后已取消所有挂单")
+			}()
 		}
 	}
 	return nil
@@ -669,7 +687,15 @@ func (s *MartingaleStrategy) handlePositionUpdate(ctx context.Context, event cor
 			s.position = nil
 			s.activeOrders = make(map[int64]*exchange.OpenOrder)
 			s.mu.Unlock()
-			s.exchange.CancelAllOrders()
+			// ★ 修复：异步执行，避免阻塞 EventBus
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						utils.Logger.Error("CancelAllOrders (POSITION HANDLER) panic", zap.Any("recover", r))
+					}
+				}()
+				s.exchange.CancelAllOrders()
+			}()
 		}
 	}
 

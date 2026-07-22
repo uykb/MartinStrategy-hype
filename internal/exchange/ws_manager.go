@@ -779,13 +779,10 @@ func (w *WSManager) handleUserFills(data json.RawMessage) {
 			ExecPrice: fill.Px,
 			Quantity:  fill.Sz,
 			Status:    "FILLED",
-		}
-
-		// 转换方向：Hyperliquid "B"=Bid=Buy, "A"=Ask=Sell
-		if fill.Side == "B" {
-			update.Side = OrderSideBuy
-		} else { // "A"
-			update.Side = OrderSideSell
+			// ★ 修复：不设置 Side。userFills 的 Side 是吃单方（aggressive）方向，
+			// 不是我方订单方向。例如 TP LIMIT SELL 被吃单时 fill.Side="B"（吃单方买入），
+			// 若映射为 OrderSideBuy 会导致 FSM 将止盈误认为买入。
+			// orderUpdates 频道提供正确的订单方向，由该频道负责设置 Side。
 		}
 
 		// 非阻塞写入订单事件缓冲 channel
