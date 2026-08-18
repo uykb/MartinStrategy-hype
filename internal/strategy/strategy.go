@@ -96,6 +96,11 @@ type MartingaleStrategy struct {
 	// 状态标志
 	gridPlaced bool
 
+	// ★ 周期代际：每次新周期入场（IDLE→PLACING_GRID）时递增。
+	// 异步撤单/重置任务捕获发起时的 cycleID，执行前检查代际是否已变化，
+	// 防止上一周期的异步 CancelAllOrders 误撤新周期的网格单/TP。
+	cycleID uint64
+
 	// ★ P2 加固：对账冻结标志（atomic，对账期间 FSM 暂停处理 tick 和 orderUpdate）
 	frozen atomic.Bool
 
@@ -222,17 +227,12 @@ func (s *MartingaleStrategy) monitorPositionStatus() {
 
 			if math.Abs(pos.Size) == 0 {
 				utils.Logger.Info("monitorPositionStatus: 持仓已清零（可能手动平仓），重置状态为 IDLE")
-				s.mu.Lock()
-				s.currentState = StateIdle
-				s.gridPlaced = false
-				s.currentTPOrderID = 0
-				s.lastTPQty = 0
-				s.lastTPPrice = 0
-				s.position = nil
-				s.activeOrders = make(map[int64]*exchange.OpenOrder)
-				s.mu.Unlock()
-
-				s.exchange.CancelAllOrders()
+				s.mu.RLock()
+				cid := s.cycleID
+				s.mu.RUnlock()
+				if s.resetToIdle(cid) {
+					go s.cancelAllOrdersGuarded(cid)
+				}
 			}
 		}
 	}
@@ -300,8 +300,17 @@ func (s *MartingaleStrategy) syncState() {
 
 		orders, err := s.exchange.GetOpenOrders()
 		if err != nil {
-			utils.Logger.Error("获取挂单列表失败", zap.Error(err))
+			utils.Logger.Error("获取挂单列表失败，延迟恢复 TP（对账防重复由 updateTP 入口负责）", zap.Error(err))
 			s.mu.Unlock()
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						utils.Logger.Error("syncState updateTP goroutine panic", zap.Any("recover", r))
+					}
+				}()
+				time.Sleep(100 * time.Millisecond)
+				s.safeUpdateTP()
+			}()
 		} else {
 			hasTP := false
 			gridCount := 0
@@ -407,6 +416,8 @@ func (s *MartingaleStrategy) handleTick(ctx context.Context, event core.Event) e
 	utils.Logger.Info("状态为 IDLE，启动入场序列")
 	s.currentState = StatePlacingGrid
 	s.gridPlaced = false
+
+	s.cycleID++ // ★ 新周期开始，代际 +1
 
 	// 关闭旧的 waitForFillAndPlaceGrid，启动新的
 	if s.waitStopCh != nil {
@@ -587,33 +598,19 @@ func (s *MartingaleStrategy) handleOrderUpdate(ctx context.Context, event core.E
 				go s.safeUpdateTP()
 			}
 		} else if order.Side == exchange.OrderSideSell {
-			utils.Logger.Info("卖单成交 (TP/手动)。重置为 IDLE。",
+			utils.Logger.Info("卖单成交 (TP/手动)，等待持仓归零后重置为 IDLE",
 				zap.String("type", string(order.Type)),
 				zap.String("status", order.Status),
 			)
 
-			s.mu.Lock()
-			s.currentState = StateIdle
-			s.currentTPOrderID = 0
-			s.gridPlaced = false
-			s.lastTPQty = 0
-			s.lastTPPrice = 0
-			s.position = nil
-			s.activeOrders = make(map[int64]*exchange.OpenOrder)
-			utils.Logger.Info("卖单成交：状态重置为 IDLE", zap.Bool("gridPlaced", s.gridPlaced))
-			s.mu.Unlock()
-
-			// ★ 修复：异步执行 CancelAllOrders，避免同步阻塞 EventBus 事件处理循环
-			// （撤销 9 层网格约需 900ms，期间所有 Tick 和订单事件排队积压）
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						utils.Logger.Error("CancelAllOrders (SELL HANDLER) panic", zap.Any("recover", r))
-					}
-				}()
-				s.exchange.CancelAllOrders()
-				utils.Logger.Info("卖单成交后已取消所有挂单")
-			}()
+			// ★ 修复：不再立即重置 FSM。先轮询确认持仓真正归零：
+			//   - 防止止盈部分成交（残留仓位）时误重置，导致新周期叠在残留仓上
+			//   - 防止持仓 API 短暂滞后时误以为周期结束
+			//   - orderUpdates 事件即使丢失/延迟，monitorPositionStatus 5s 轮询兜底
+			s.mu.RLock()
+			cid := s.cycleID
+			s.mu.RUnlock()
+			go s.waitPositionZeroThenReset(cid)
 		}
 	}
 	return nil
@@ -678,24 +675,13 @@ func (s *MartingaleStrategy) handlePositionUpdate(ctx context.Context, event cor
 		if state != StateIdle {
 			utils.Logger.Info("持仓更新：持仓为零但状态非 IDLE，重置为 IDLE",
 				zap.String("prev_state", string(state)))
-			s.mu.Lock()
-			s.currentState = StateIdle
-			s.gridPlaced = false
-			s.currentTPOrderID = 0
-			s.lastTPQty = 0
-			s.lastTPPrice = 0
-			s.position = nil
-			s.activeOrders = make(map[int64]*exchange.OpenOrder)
-			s.mu.Unlock()
-			// ★ 修复：异步执行，避免阻塞 EventBus
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						utils.Logger.Error("CancelAllOrders (POSITION HANDLER) panic", zap.Any("recover", r))
-					}
-				}()
-				s.exchange.CancelAllOrders()
-			}()
+			s.mu.RLock()
+			cid := s.cycleID
+			s.mu.RUnlock()
+			if s.resetToIdle(cid) {
+				// ★ 修复：异步执行 + 周期代际保护，避免阻塞 EventBus 且不误撤新周期订单
+				go s.cancelAllOrdersGuarded(cid)
+			}
 		}
 	}
 
@@ -803,6 +789,115 @@ func (s *MartingaleStrategy) safeUpdateTP() {
 		utils.Logger.Warn("dirty 标志在重跑后仍存在，留给下次调用处理",
 			zap.Int("completed_retries", maxTPDirtyRetries))
 	}
+}
+
+// resetToIdle 将 FSM 状态重置为 IDLE（带周期代际校验）。
+// 返回是否实际执行了重置；只有实际重置时才应发起撤单。
+func (s *MartingaleStrategy) resetToIdle(cycleID uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.currentState == StateIdle || s.cycleID != cycleID {
+		return false
+	}
+	s.currentState = StateIdle
+	s.currentTPOrderID = 0
+	s.gridPlaced = false
+	s.lastTPQty = 0
+	s.lastTPPrice = 0
+	s.position = nil
+	s.activeOrders = make(map[int64]*exchange.OpenOrder)
+	utils.Logger.Info("FSM 已重置为 IDLE", zap.Uint64("cycle_id", cycleID))
+	return true
+}
+
+// waitPositionZeroThenReset 卖单成交后轮询持仓，确认归零才重置 FSM。
+//
+// 背景与动机：
+//   - 原实现收到 SELL FILLED 立即重置 IDLE 并撤单；若止盈部分成交（残留仓位）
+//     或持仓 API 短暂滞后，提前重置会让新周期叠在残留仓上。
+//   - orderUpdates 的 SELL 事件即使丢失/乱序，monitorPositionStatus 5s 轮询
+//     和 handlePositionUpdate 仍是兜底重置路径。
+func (s *MartingaleStrategy) waitPositionZeroThenReset(cycleID uint64) {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Logger.Error("waitPositionZeroThenReset panic 恢复", zap.Any("recover", r), zap.Stack("stack"))
+		}
+	}()
+
+	const maxAttempts = 15 // 2s 间隔，最长约 30s
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		pos, err := s.exchange.GetPosition()
+		if err != nil {
+			utils.Logger.Warn("等待持仓归零：查询持仓失败",
+				zap.Int("attempt", attempt+1), zap.Error(err))
+		} else if math.Abs(pos.Size) == 0 {
+			utils.Logger.Info("持仓已归零，重置 FSM 为 IDLE", zap.Int("attempt", attempt+1))
+			if s.resetToIdle(cycleID) {
+				go s.cancelAllOrdersGuarded(cycleID)
+			}
+			return
+		} else {
+			utils.Logger.Debug("等待持仓归零：仍有持仓（可能部分成交）",
+				zap.Float64("size", pos.Size), zap.Int("attempt", attempt+1))
+		}
+
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	// 超时后仍有持仓：按"止盈部分成交"处理，重新对齐 TP，保持 IN_POSITION，
+	// 不重置 FSM（避免新周期叠在残留仓上）。
+	utils.Logger.Warn("等待持仓归零超时，按部分成交处理：重新对齐 TP")
+	s.mu.RLock()
+	state := s.currentState
+	s.mu.RUnlock()
+	if state == StateInPosition {
+		go s.safeUpdateTP()
+	}
+}
+
+// cancelAllOrdersGuarded 异步撤销当前周期的全部挂单，带周期代际保护。
+// 撤销前校验 cycleID：若已进入新周期（cycleID 变化）则中止，防止旧周期的
+// 异步撤单误撤新周期的网格单/TP。订单列表在发起时快照，此时新周期尚不可能
+// 已下网格单（新周期至少需要数秒才会放置网格），因此快照只包含旧周期订单。
+func (s *MartingaleStrategy) cancelAllOrdersGuarded(cycleID uint64) {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Logger.Error("cancelAllOrdersGuarded panic 恢复", zap.Any("recover", r))
+		}
+	}()
+
+	s.mu.RLock()
+	current := s.cycleID
+	s.mu.RUnlock()
+	if current != cycleID {
+		utils.Logger.Debug("撤单中止：周期已变更",
+			zap.Uint64("expected", cycleID), zap.Uint64("current", current))
+		return
+	}
+
+	orders, err := s.exchange.GetOpenOrders()
+	if err != nil {
+		utils.Logger.Warn("撤单失败：获取挂单列表出错", zap.Error(err))
+		return
+	}
+
+	cancelled := 0
+	for _, o := range orders {
+		if err := s.exchange.CancelOrder(o.OrderID); err != nil {
+			utils.Logger.Warn("撤单失败", zap.Int64("order_id", o.OrderID), zap.Error(err))
+			continue
+		}
+		cancelled++
+		time.Sleep(100 * time.Millisecond)
+	}
+	utils.Logger.Info("周期撤单完成",
+		zap.Int("cancelled", cancelled),
+		zap.Int("total", len(orders)),
+		zap.Uint64("cycle_id", cycleID))
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,6 +1316,25 @@ func (s *MartingaleStrategy) updateTP() {
 		zap.Float64("tp_price", tpPrice),
 		zap.Float64("tp_pct", 0.80),
 		zap.Float64("tp_qty", newQty))
+
+	// ★ 修复：防止重建/修改 TP 时价格已经可成交（重启后瞬间平仓）。
+	// 场景：上次退出时 main 的优雅关闭撤掉了全部挂单（含 TP），重启后发现
+	// 有持仓但无 TP；若此时市价已 ≥ 持仓均价×1.008，重建的 SELL LIMIT 会
+	// 立即成交，用户持仓在重启瞬间被平掉。这里校验市价，价格可成交时
+	// 跳过本次更新，等价格回落后由后续 updateTP 恢复止盈保护。
+	marketPrice, priceErr := s.exchange.GetLatestPrice()
+	if priceErr != nil {
+		utils.Logger.Warn("获取市价失败，跳过本次 TP 更新（防止追价成交），等待下次重试",
+			zap.Error(priceErr))
+		return
+	}
+	if tpPrice <= marketPrice {
+		utils.Logger.Warn("TP 价格已不高于市价，跳过 TP 更新（避免限价卖单立即成交）",
+			zap.Float64("tp_price", tpPrice),
+			zap.Float64("market_price", marketPrice),
+			zap.Float64("entry_price", pos.EntryPrice))
+		return
+	}
 
 	// ★ 优先使用 ModifyOrder 原子替换（避免取消+重建的空窗期）
 	if oldTPID != 0 {

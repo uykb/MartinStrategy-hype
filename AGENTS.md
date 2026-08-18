@@ -220,12 +220,17 @@ if qty * price < minNotional {
 - **TP price**: `RoundToSigFigs(entryPrice * 1.008, 5, maxPriceDecimals)` — fixed **+0.80%** markup
 - **TP quantity**: `FloorToDecimals(abs(pos.Size), quantityPrecision)` — full position close, floor truncated to prevent residual phantom position
 - **Updated after**: each safety order fill, grid placement, position update event, or restart
+- **防追价保护**: 重建/修改 TP 前校验当前市价，若 `tpPrice ≤ 市价` 则跳过本次更新，
+  防止重启后重建的 SELL LIMIT 立即成交平仓（等价格回落后再恢复）
+- **ReduceOnly**: 所有 SELL 订单（TP）强制 ReduceOnly，防止数量与持仓不一致时开出反向空仓
 
 #### TP Update Flow (strategy.go:1100-1322)
 
 1. If position size is zero → clear TP state, return
 2. **Entry reconciliation**: if `currentTPOrderID == 0`, call `findLiveTP()` to claim any existing TP on exchange (prevents duplicate create on restart)
 3. **Change detection**: if `newQty == prevQty && oldTPID != 0` → skip (no ATR fetch, no TP modify)
+3.5 **市价防追价**: 计算 tpPrice 后先取当前市价；若 `tpPrice ≤ 市价`，跳过修改/新建，
+    等待价格回落后由后续 updateTP 恢复（防止重启后瞬间平仓）
 4. **Modify priority**: if `oldTPID != 0`, try `ModifyOrder()` first (atomic cancel+place, no protection gap)
 5. **Modify failure reconciliation**: if modify fails, query exchange real state via `findLiveTP()`:
    - `liveID != oldTPID` → modify actually succeeded server-side, just sync local state
@@ -281,6 +286,15 @@ IDLE → PriceUpdate Tick (fresh, ≤2s old)
            4. If all placed, gridPlaced=true
        → safeUpdateTP()
 ```
+
+## Cycle Completion (止盈后回到 IDLE)
+
+- SELL FILLED 事件不再直接重置 FSM：先轮询 `GetPosition()` 确认持仓归零
+  （2s 间隔，最多 30s），归零后才重置 IDLE 并异步撤单
+- 若止盈部分成交（残留仓位），不重置 FSM，而是重新对齐 TP（safeUpdateTP）
+- 撤单带周期代际保护（`cycleID`）：新周期开始（IDLE→PLACING_GRID）后，
+  旧周期的异步 `CancelAllOrders` 自动中止，防止误撤新周期的网格单/TP
+- `monitorPositionStatus`（5s）与 `handlePositionUpdate` 仍是兜底重置路径
 
 ## Price Precision (Hyperliquid Rules)
 

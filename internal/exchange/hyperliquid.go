@@ -393,11 +393,12 @@ func (h *HyperliquidAdapter) CreateOrder(
 
 	// 构建 SDK 订单请求
 	req := hyperliquid.CreateOrderRequest{
-		Coin:       h.cfg.Symbol,
-		IsBuy:      side == OrderSideBuy,
-		Size:       quantity,
-		Price:      price,
-		ReduceOnly: false,
+		Coin:  h.cfg.Symbol,
+		IsBuy: side == OrderSideBuy,
+		Size:  quantity,
+		Price: price,
+		// ★ 修复：卖单（止盈/平仓）必须 ReduceOnly，防止数量与持仓不一致时开出反向空仓
+		ReduceOnly: side == OrderSideSell,
 	}
 
 	// 设置订单类型
@@ -484,11 +485,12 @@ func (h *HyperliquidAdapter) ModifyOrder(
 
 	// 构建 SDK 修改请求
 	req := hyperliquid.CreateOrderRequest{
-		Coin:       h.cfg.Symbol,
-		IsBuy:      side == OrderSideBuy,
-		Size:       quantity,
-		Price:      price,
-		ReduceOnly: false,
+		Coin:  h.cfg.Symbol,
+		IsBuy: side == OrderSideBuy,
+		Size:  quantity,
+		Price: price,
+		// ★ 修复：卖单（止盈/平仓）必须 ReduceOnly，防止数量与持仓不一致时开出反向空仓
+		ReduceOnly: side == OrderSideSell,
 	}
 
 	switch orderType {
