@@ -897,7 +897,7 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 		unitQty = s.minQty
 	}
 
-	baseQty := unitQty * 1.0
+	baseQty := unitQty * 0.06 // ★ 恢复用户自定义：首仓占用 6%
 	// ★ 审计修复：数量使用 FloorToDecimals 向下取整，杜绝四舍五入
 	baseQty = utils.FloorToDecimals(baseQty, s.quantityPrecision)
 
@@ -1473,42 +1473,40 @@ func (s *MartingaleStrategy) calcAllocatedChunk() float64 {
 
 // getGridMultiplier 计算网格加仓数量倍数。
 //
-// 新的数量递增规则（从第三次开始斐波那契递增）：
+// 固定数量递增规则（用户定制，按总资产百分比）：
 //
 //	层级  倍数    说明
-//	 1    1.0    首仓 = base_ratio
-//	 2    0.5    第一次加仓 = 1/2 × base_ratio
-//	 3    0.5    第二次加仓 = 1/2 × base_ratio
-//	 4    1.0    第三次加仓 = base_ratio
-//	 5    1.0    第四次加仓 = base_ratio
-//	 6    2.0    第五次加仓 = 第三次+第四次 = 1+1
-//	 7    3.0    第六次加仓 = 第四次+第五次 = 1+2
-//	 8    5.0    第七次加仓 = 第五次+第六次 = 2+3
-//	 9    8.0    第八次加仓 = 第六次+第七次 = 3+5
-//	...  斐波那契递增 ...
+//	 1    0.03   加仓1 = 3%
+//	 2    0.03   加仓2 = 3%
+//	 3    0.05   加仓3 = 5%
+//	 4    0.05   加仓4 = 5%
+//	 5    0.18   加仓5 = 18%
+//	 6    0.32   加仓6 = 32%
+//	 7    0.567  加仓7 = 56.7%
+//	 8    0.578  加仓8 = 57.8%
+//	 9    1.16   加仓9 = 116%
+//	...  1.16   后续层使用最后一层倍数
 //
-// 返回值以 0.5 为单位（即 base_ratio 的倍数 × 2），
-// 调用方乘以 unitQty 后得到实际数量。
+// 首仓使用 enterLong 中硬编码的 0.06 (6%)，不通过此函数。
 func (s *MartingaleStrategy) getGridMultiplier(level int) float64 {
-	// 前两层使用半仓
 	switch level {
 	case 1:
-		return 1.0 // 首仓 = base_ratio
+		return 0.03
 	case 2:
-		return 0.5 // 第一次加仓 = 1/2 × base_ratio
+		return 0.03
 	case 3:
-		return 0.5 // 第二次加仓 = 1/2 × base_ratio
+		return 0.05
 	case 4:
-		return 1.0 // 第三次加仓 = base_ratio
+		return 0.05
 	case 5:
-		return 1.0 // 第四次加仓 = base_ratio
+		return 0.18
+	case 6:
+		return 0.32
+	case 7:
+		return 0.567
+	case 8:
+		return 0.578
 	default:
-		// 从第六层开始斐波那契递增：F(n-2) + F(n-1)
-		// level 6 → 2.0, level 7 → 3.0, level 8 → 5.0, level 9 → 8.0, ...
-		a, b := 1.0, 1.0 // 对应 level 4=1.0, level 5=1.0
-		for i := 6; i <= level; i++ {
-			a, b = b, a+b
-		}
-		return b
+		return 1.16
 	}
 }
