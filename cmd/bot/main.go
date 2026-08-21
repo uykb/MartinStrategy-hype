@@ -17,7 +17,6 @@ import (
 	"github.com/uykb/MartinStrategy/internal/core"
 	"github.com/uykb/MartinStrategy/internal/exchange"
 	"github.com/uykb/MartinStrategy/internal/health"
-	"github.com/uykb/MartinStrategy/internal/storage"
 	"github.com/uykb/MartinStrategy/internal/strategy"
 	"github.com/uykb/MartinStrategy/internal/utils"
 	"go.uber.org/zap"
@@ -46,19 +45,6 @@ func main() {
 	utils.Logger.Info("马丁格尔策略机器人启动",
 		zap.String("symbol", cfg.Exchange.Symbol),
 		zap.Bool("testnet", cfg.Exchange.UseTestnet))
-
-	// ---------------------------------------------------------------
-	// 3. 初始化存储（SQLite + Redis）
-	// ---------------------------------------------------------------
-	db, err := storage.InitStorage(
-		cfg.Storage.SqlitePath,
-		cfg.Storage.RedisAddr,
-		cfg.Storage.RedisPass,
-		cfg.Storage.RedisDB,
-	)
-	if err != nil {
-		utils.Logger.Fatal("存储初始化失败", zap.Error(err))
-	}
 
 	// ---------------------------------------------------------------
 	// 4. 创建事件总线
@@ -96,7 +82,7 @@ func main() {
 	// ★ 策略仅依赖 ExchangeAdapter 接口，对底层交易所完全透明
 	// FSM 状态转移逻辑未做任何修改：
 	//   IDLE → PLACING_GRID → IN_POSITION → IDLE
-	strat := strategy.NewMartingaleStrategy(&cfg.Strategy, ex, db, bus)
+	strat := strategy.NewMartingaleStrategy(&cfg.Strategy, ex, bus)
 	go strat.Start()
 
 	// ---------------------------------------------------------------

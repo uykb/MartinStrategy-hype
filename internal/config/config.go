@@ -20,7 +20,6 @@ import (
 type Config struct {
 	Exchange ExchangeConfig `mapstructure:"exchange"`
 	Strategy StrategyConfig `mapstructure:"strategy"`
-	Storage  StorageConfig  `mapstructure:"storage"`
 	Log      LogConfig      `mapstructure:"log"`
 	Health   *HealthConfig  `mapstructure:"health"` // ★ P2 加固：健康检查配置
 }
@@ -42,16 +41,7 @@ type ExchangeConfig struct {
 // StrategyConfig 策略配置
 type StrategyConfig struct {
 	MaxSafetyOrders int     `mapstructure:"max_safety_orders"` // 最大网格层数
-	AtrPeriod       int     `mapstructure:"atr_period"`        // ATR 计算周期
 	BaseRatio       float64 `mapstructure:"base_ratio"`        // 头仓比例（余额 × base_ratio）
-}
-
-// StorageConfig 存储配置
-type StorageConfig struct {
-	SqlitePath string `mapstructure:"sqlite_path"`
-	RedisAddr  string `mapstructure:"redis_addr"`
-	RedisPass  string `mapstructure:"redis_pass"`
-	RedisDB    int    `mapstructure:"redis_db"`
 }
 
 // LogConfig 日志配置
@@ -74,11 +64,7 @@ func LoadConfig(path string) (*Config, error) {
 	viper.SetDefault("exchange.symbol", "HYPE")
 	viper.SetDefault("exchange.use_testnet", false)
 	viper.SetDefault("strategy.max_safety_orders", 9)
-	viper.SetDefault("strategy.atr_period", 14)
 	viper.SetDefault("strategy.base_ratio", 0.05)
-	viper.SetDefault("storage.sqlite_path", "data/bot.db")
-	viper.SetDefault("storage.redis_addr", "") // 空字符串 = 不启用 Redis
-	viper.SetDefault("storage.redis_db", 0)
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("health.addr", ":8080")
 

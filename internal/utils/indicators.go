@@ -41,22 +41,3 @@ func FloorToTickSize(num float64, tickSize float64) float64 {
 	return math.Floor(num/tickSize+0.00000001) * tickSize
 }
 
-// RoundUpToTickSize rounds up a number to the nearest multiple of tickSize
-// 注意：此函数使用向上取整，仅适用于价格等非数量字段。
-// 数量（Size）计算请使用 FloorToTickSize。
-// Example: num=0.1666, tickSize=0.01 -> 0.17
-func RoundUpToTickSize(num float64, tickSize float64) float64 {
-	if tickSize == 0 {
-		return num
-	}
-	return math.Ceil(num/tickSize-0.00000001) * tickSize
-}
-
-// RoundToTickSize rounds a number to the nearest multiple of tickSize (standard rounding)
-// Used for price formatting to match exchange filters
-func RoundToTickSize(num float64, tickSize float64) float64 {
-	if tickSize == 0 {
-		return num
-	}
-	return math.Round(num/tickSize) * tickSize
-}

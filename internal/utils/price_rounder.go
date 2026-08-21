@@ -95,50 +95,6 @@ func parseFloat(s string) (float64, error) {
 	return strconv.ParseFloat(s, 64)
 }
 
-// FormatPriceForOrder 将价格格式化为 Hyperliquid 下单所需的字符串。
-// 先截断有效数字，再格式化为字符串，避免浮点尾部噪声。
-//
-// 参数：
-//   - price:      原始价格
-//   - sigFigs:    有效数字位数（通常 5）
-//   - maxDecimals: 最大小数位数（6 - szDecimals）
-//
-// 返回：
-//   - 格式化后的价格字符串（如 "102.35"）
-func FormatPriceForOrder(price float64, sigFigs int, maxDecimals int) string {
-	rounded := RoundToSigFigs(price, sigFigs, maxDecimals)
-
-	// 整数价格直接返回整数形式
-	if rounded == math.Trunc(rounded) && math.Abs(rounded) >= 1 {
-		return fmt.Sprintf("%.0f", rounded)
-	}
-
-	// 非整数：按 maxDecimals 格式化
-	if maxDecimals >= 0 {
-		format := fmt.Sprintf("%%.%df", maxDecimals)
-		return fmt.Sprintf(format, rounded)
-	}
-
-	// 降级：使用 %g 自动格式化
-	return fmt.Sprintf("%g", rounded)
-}
-
-// FormatSizeForOrder 将下单数量格式化为字符串，遵守 szDecimals 精度限制。
-//
-// 参数：
-//   - size:       原始数量
-//   - szDecimals: Hyperliquid 允许的数量小数位数
-//
-// 返回：
-//   - 格式化后的数量字符串
-func FormatSizeForOrder(size float64, szDecimals int) string {
-	if szDecimals < 0 {
-		szDecimals = 0
-	}
-	format := fmt.Sprintf("%%.%df", szDecimals)
-	return fmt.Sprintf(format, size)
-}
-
 // CalcMaxPriceDecimals 根据 szDecimals 计算 Hyperliquid 允许的最大价格小数位数。
 // 公式：maxDecimals = MAX_DECIMALS - szDecimals
 // 其中 MAX_DECIMALS 对永续合约为 6，对现货为 8。

@@ -21,7 +21,6 @@ import (
 	"github.com/uykb/MartinStrategy/internal/config"
 	"github.com/uykb/MartinStrategy/internal/core"
 	"github.com/uykb/MartinStrategy/internal/exchange"
-	"github.com/uykb/MartinStrategy/internal/storage"
 	"github.com/uykb/MartinStrategy/internal/utils"
 	"go.uber.org/zap"
 )
@@ -54,7 +53,6 @@ const MaxTickStaleness = 2 * time.Second
 type MartingaleStrategy struct {
 	cfg      *config.StrategyConfig
 	exchange exchange.ExchangeAdapter
-	storage  *storage.Database
 	bus      *core.EventBus
 
 	mu               sync.RWMutex
@@ -116,12 +114,11 @@ type MartingaleStrategy struct {
 }
 
 // NewMartingaleStrategy 创建策略实例
-func NewMartingaleStrategy(cfg *config.StrategyConfig, ex exchange.ExchangeAdapter, st *storage.Database, bus *core.EventBus) *MartingaleStrategy {
+func NewMartingaleStrategy(cfg *config.StrategyConfig, ex exchange.ExchangeAdapter, bus *core.EventBus) *MartingaleStrategy {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &MartingaleStrategy{
 		cfg:          cfg,
 		exchange:     ex,
-		storage:      st,
 		bus:          bus,
 		currentState: StateIdle,
 		activeOrders: make(map[int64]*exchange.OpenOrder),
