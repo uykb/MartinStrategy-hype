@@ -230,9 +230,7 @@ func (s *MartingaleStrategy) monitorPositionStatus() {
 				s.mu.RLock()
 				cid := s.cycleID
 				s.mu.RUnlock()
-				if s.resetToIdle(cid) {
-					go s.cancelAllOrdersGuarded(cid)
-				}
+				go s.cleanCycleAndResetToIdle(cid)
 			}
 		}
 	}
@@ -678,10 +676,7 @@ func (s *MartingaleStrategy) handlePositionUpdate(ctx context.Context, event cor
 			s.mu.RLock()
 			cid := s.cycleID
 			s.mu.RUnlock()
-			if s.resetToIdle(cid) {
-				// ★ 修复：异步执行 + 周期代际保护，避免阻塞 EventBus 且不误撤新周期订单
-				go s.cancelAllOrdersGuarded(cid)
-			}
+			go s.cleanCycleAndResetToIdle(cid)
 		}
 	}
 
@@ -793,6 +788,33 @@ func (s *MartingaleStrategy) safeUpdateTP() {
 
 // resetToIdle 将 FSM 状态重置为 IDLE（带周期代际校验）。
 // 返回是否实际执行了重置；只有实际重置时才应发起撤单。
+// cleanCycleAndResetToIdle 异步清理当前周期的遗留订单，然后重置状态为 IDLE。
+// ★ 修复核心：必须在状态变为 IDLE 前撤销所有挂单，否则新周期开启后
+// 旧周期的网格单会欺骗 placeGridOrders 导致不部署新网格。
+func (s *MartingaleStrategy) cleanCycleAndResetToIdle(cycleID uint64) {
+	// 防重复调用检查
+	s.mu.RLock()
+	current := s.cycleID
+	state := s.currentState
+	s.mu.RUnlock()
+	if current != cycleID || state == StateIdle {
+		return
+	}
+
+	utils.Logger.Info("开始周期清理：撤销全部挂单", zap.Uint64("cycle_id", cycleID))
+	
+	// 1. 同步撤销当前交易对的所有挂单（耗时约 100-500ms）
+	// 在此期间，FSM 状态仍非 IDLE，安全阻挡了 tick 触发新周期
+	if err := s.exchange.CancelAllOrders(); err != nil {
+		utils.Logger.Warn("周期清理：撤单可能不完整", zap.Error(err))
+	} else {
+		utils.Logger.Info("周期清理：挂单撤销完成")
+	}
+
+	// 2. 挂单清理干净后，再敞开大门，允许新周期启动
+	s.resetToIdle(cycleID)
+}
+
 func (s *MartingaleStrategy) resetToIdle(cycleID uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -832,9 +854,7 @@ func (s *MartingaleStrategy) waitPositionZeroThenReset(cycleID uint64) {
 				zap.Int("attempt", attempt+1), zap.Error(err))
 		} else if math.Abs(pos.Size) == 0 {
 			utils.Logger.Info("持仓已归零，重置 FSM 为 IDLE", zap.Int("attempt", attempt+1))
-			if s.resetToIdle(cycleID) {
-				go s.cancelAllOrdersGuarded(cycleID)
-			}
+			go s.cleanCycleAndResetToIdle(cycleID)
 			return
 		} else {
 			utils.Logger.Debug("等待持仓归零：仍有持仓（可能部分成交）",
@@ -859,46 +879,6 @@ func (s *MartingaleStrategy) waitPositionZeroThenReset(cycleID uint64) {
 	}
 }
 
-// cancelAllOrdersGuarded 异步撤销当前周期的全部挂单，带周期代际保护。
-// 撤销前校验 cycleID：若已进入新周期（cycleID 变化）则中止，防止旧周期的
-// 异步撤单误撤新周期的网格单/TP。订单列表在发起时快照，此时新周期尚不可能
-// 已下网格单（新周期至少需要数秒才会放置网格），因此快照只包含旧周期订单。
-func (s *MartingaleStrategy) cancelAllOrdersGuarded(cycleID uint64) {
-	defer func() {
-		if r := recover(); r != nil {
-			utils.Logger.Error("cancelAllOrdersGuarded panic 恢复", zap.Any("recover", r))
-		}
-	}()
-
-	s.mu.RLock()
-	current := s.cycleID
-	s.mu.RUnlock()
-	if current != cycleID {
-		utils.Logger.Debug("撤单中止：周期已变更",
-			zap.Uint64("expected", cycleID), zap.Uint64("current", current))
-		return
-	}
-
-	orders, err := s.exchange.GetOpenOrders()
-	if err != nil {
-		utils.Logger.Warn("撤单失败：获取挂单列表出错", zap.Error(err))
-		return
-	}
-
-	cancelled := 0
-	for _, o := range orders {
-		if err := s.exchange.CancelOrder(o.OrderID); err != nil {
-			utils.Logger.Warn("撤单失败", zap.Int64("order_id", o.OrderID), zap.Error(err))
-			continue
-		}
-		cancelled++
-		time.Sleep(100 * time.Millisecond)
-	}
-	utils.Logger.Info("周期撤单完成",
-		zap.Int("cancelled", cancelled),
-		zap.Int("total", len(orders)),
-		zap.Uint64("cycle_id", cycleID))
-}
 
 // ---------------------------------------------------------------------------
 // 策略动作
