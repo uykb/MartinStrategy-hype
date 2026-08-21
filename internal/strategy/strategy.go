@@ -1460,14 +1460,19 @@ func (s *MartingaleStrategy) calcAllocatedChunk() float64 {
 		utils.Logger.Error("获取余额失败，使用 MinOrderValue", zap.Error(err))
 		return MinOrderValue
 	}
-	notional := balance * s.cfg.BaseRatio
+	// ★ 修复：用户希望直接使用 0.06 代表 6% 的总资金，
+	// 因此基准金额 (Allocated Chunk) 必须是 100% 的当前总余额。
+	// 忽略 config 中的 BaseRatio，防止 0.05 * 0.06 = 0.3% 的微缩错误。
+	notional := balance
+	
 	if notional < MinOrderValue {
 		notional = MinOrderValue
 	}
-	utils.Logger.Info("动态 MinNotional",
+	
+	utils.Logger.Info("基准仓位额度计算 (Allocated Chunk)",
 		zap.Float64("balance", balance),
-		zap.Float64("ratio", s.cfg.BaseRatio),
 		zap.Float64("notional", notional))
+		
 	return notional
 }
 
