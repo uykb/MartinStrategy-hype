@@ -6,6 +6,7 @@ package utils
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -91,10 +92,7 @@ func roundToSignificantFigures(val float64, n int) float64 {
 // parseFloat 安全解析浮点数字符串，兼容科学计数法
 func parseFloat(s string) (float64, error) {
 	s = strings.TrimSpace(s)
-	// 移除可能的前导零问题
-	var result float64
-	_, err := fmt.Sscanf(s, "%f", &result)
-	return result, err
+	return strconv.ParseFloat(s, 64)
 }
 
 // FormatPriceForOrder 将价格格式化为 Hyperliquid 下单所需的字符串。

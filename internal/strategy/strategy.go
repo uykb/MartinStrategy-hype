@@ -888,8 +888,8 @@ func (s *MartingaleStrategy) waitPositionZeroThenReset(cycleID uint64) {
 func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 	utils.Logger.Info("正在入场做多...")
 
-	minNotional := s.calcMinNotional()
-	unitQtyRaw := minNotional / currentPrice
+	allocatedChunk := s.calcAllocatedChunk()
+	unitQtyRaw := allocatedChunk / currentPrice
 	// ★ 审计修复：数量使用 Floor 截断，防止向上取整导致余额不足
 	unitQty := utils.FloorToTickSize(unitQtyRaw, s.stepSize)
 
@@ -903,12 +903,20 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 
 	// ★ 运行时修复：Floor 截断后金额可能略低于 MinNotional（如 9.44 < 10），
 	// 需要向上微调一个 stepSize 确保满足交易所最低金额要求。
-	if baseQty*currentPrice < minNotional {
-		baseQty = utils.FloorToDecimals(baseQty+s.stepSize, s.quantityPrecision)
-		utils.Logger.Info("金额不足，微调数量",
+	// ★ 修复：与交易所真实最小要求（MinOrderValue）对比
+	if baseQty*currentPrice < MinOrderValue {
+		qtyNeeded := MinOrderValue / currentPrice
+		baseQty = utils.FloorToTickSize(qtyNeeded, s.stepSize)
+		baseQty = utils.FloorToDecimals(baseQty, s.quantityPrecision)
+		
+		if baseQty*currentPrice < MinOrderValue {
+			baseQty = utils.FloorToDecimals(baseQty+s.stepSize, s.quantityPrecision)
+		}
+		
+		utils.Logger.Info("基础下单金额不足，提升至交易所最低限制",
 			zap.Float64("adjusted_qty", baseQty),
 			zap.Float64("value", baseQty*currentPrice),
-			zap.Float64("min_notional", minNotional))
+			zap.Float64("min_order_value", MinOrderValue))
 	}
 
 	utils.Logger.Info("计算基础下单量",
@@ -1023,9 +1031,9 @@ func (s *MartingaleStrategy) placeGridOrders() {
 	// Level 7: -4.5%  Level 8: -4.8%  Level 9: -7.7%
 	gridPercents := []float64{0.010, 0.010, 0.010, 0.011, 0.021, 0.022, 0.045, 0.048, 0.077}
 
-	minNotional := s.calcMinNotional()
+	allocatedChunk := s.calcAllocatedChunk()
 	// ★ 审计修复：数量使用 FloorToTickSize 向下取整
-	unitQty := utils.FloorToTickSize(minNotional/entryPrice, s.stepSize)
+	unitQty := utils.FloorToTickSize(allocatedChunk/entryPrice, s.stepSize)
 
 	utils.Logger.Info("放置网格订单",
 		zap.Float64("Entry", entryPrice),
@@ -1060,13 +1068,13 @@ func (s *MartingaleStrategy) placeGridOrders() {
 		volMult := s.getGridMultiplier(i)
 		qty := unitQty * float64(volMult)
 
-		if qty*price < minNotional {
+		if qty*price < MinOrderValue {
 			utils.Logger.Info("调整数量以满足最低下单金额",
 				zap.Int("index", i),
 				zap.Float64("old_qty", qty),
 				zap.Float64("price", price),
 			)
-			qty = minNotional / price
+			qty = MinOrderValue / price
 		}
 
 		// ★ 审计修复：数量严格向下取整，防止余额不足和幽灵尾仓
@@ -1075,13 +1083,13 @@ func (s *MartingaleStrategy) placeGridOrders() {
 
 		// ★ 运行时修复：Floor 截断后金额可能略低于 MinNotional，
 		// 需要向上微调一个 stepSize 确保满足交易所最低金额要求。
-		if qty*price < minNotional {
+		if qty*price < MinOrderValue {
 			qty = utils.FloorToDecimals(qty+s.stepSize, s.quantityPrecision)
 			utils.Logger.Info("Floor 截断后金额不足，微调数量",
 				zap.Int("index", i),
 				zap.Float64("adjusted_qty", qty),
 				zap.Float64("value", qty*price),
-				zap.Float64("min_notional", minNotional))
+				zap.Float64("min_order_value", MinOrderValue))
 		}
 
 		// ★ P1 加固：带重试的下单逻辑（3次重试 + 抖动退避）
@@ -1445,8 +1453,8 @@ func (s *MartingaleStrategy) updateTP() {
 // 辅助方法
 // ---------------------------------------------------------------------------
 
-// calcMinNotional 动态计算最低下单金额
-func (s *MartingaleStrategy) calcMinNotional() float64 {
+// calcAllocatedChunk 动态计算最低下单金额
+func (s *MartingaleStrategy) calcAllocatedChunk() float64 {
 	balance, err := s.exchange.GetBalance()
 	if err != nil {
 		utils.Logger.Error("获取余额失败，使用 MinOrderValue", zap.Error(err))
