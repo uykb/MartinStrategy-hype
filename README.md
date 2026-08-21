@@ -191,19 +191,20 @@ curl http://localhost:8080/readyz    # readiness (WS active + FSM not frozen = 2
 
 ### Position Sizing
 
-Base order = `balance × base_ratio (0.05)`, minimum $10 USDC. Safety order multipliers follow a Fibonacci-like sequence:
+Base order = `balance × 6%`, minimum $10 USDC. Safety order sizing is configured explicitly to match specific asset characteristics:
 
-| Level | Multiplier | Size (unitQty=1) |
-|-------|-----------|-------------------|
-| 1 (base) | 1.0 | 1.0 |
-| 2 | 0.5 | 0.5 |
-| 3 | 0.5 | 0.5 |
-| 4 | 1.0 | 1.0 |
-| 5 | 1.0 | 1.0 |
-| 6 | 2.0 | 2.0 |
-| 7 | 3.0 | 3.0 |
-| 8 | 5.0 | 5.0 |
-| 9 | 8.0 | 8.0 |
+| Level | Asset Allocation % |
+|-------|--------------------|
+| 1 (base) | 6% |
+| 2 (Grid 1) | 3% |
+| 3 (Grid 2) | 3% |
+| 4 (Grid 3) | 5% |
+| 5 (Grid 4) | 5% |
+| 6 (Grid 5) | 18% |
+| 7 (Grid 6) | 32% |
+| 8 (Grid 7) | 56.7% |
+| 9 (Grid 8) | 57.8% |
+| 10 (Grid 9+) | 116% |
 
 ### Take-Profit
 
