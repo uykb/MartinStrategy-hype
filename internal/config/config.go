@@ -66,7 +66,7 @@ func LoadConfig(path string) (*Config, error) {
 	viper.SetDefault("exchange.use_testnet", false)
 	viper.SetDefault("strategy.max_safety_orders", 9)
 	viper.SetDefault("strategy.base_ratio", 0.05)
-	viper.SetDefault("strategy.max_slippage_ratio", 0.005) // 默认 0.5% 滑点保护
+	viper.SetDefault("strategy.max_slippage_ratio", 0.001) // 默认 0.1% 滑点保护
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("health.addr", ":8080")
 
