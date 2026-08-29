@@ -26,3 +26,7 @@ config.yaml
 
 # Go
 vendor/
+# Sensitive files and local dependencies
+ssh.ppk
+.opencode/deps/
+.opencode/
