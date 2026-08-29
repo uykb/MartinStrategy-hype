@@ -371,6 +371,47 @@ func (h *HyperliquidAdapter) GetBalance() (float64, error) {
 	return balance, nil
 }
 
+// CalculateSlippage 计算预期成交价和所需最差限价
+func (h *HyperliquidAdapter) CalculateSlippage(side OrderSide, qty float64) (float64, float64, error) {
+	ob := h.wsManager.GetOrderBook()
+
+	var levels []wsLevel
+	if side == OrderSideBuy {
+		levels = ob.Asks // 买单吃掉卖盘
+	} else {
+		levels = ob.Bids // 卖单吃掉买盘
+	}
+
+	if len(levels) == 0 {
+		return 0, 0, fmt.Errorf("订单薄为空，无法计算滑点")
+	}
+
+	remaining := qty
+	totalCost := 0.0
+	worstPrice := 0.0
+
+	for _, level := range levels {
+		take := level.Sz
+		if remaining < take {
+			take = remaining
+		}
+		totalCost += take * level.Px
+		remaining -= take
+		worstPrice = level.Px
+
+		if remaining <= 0 {
+			break
+		}
+	}
+
+	if remaining > 0 {
+		return 0, 0, fmt.Errorf("订单薄深度不足: 需 %f, 缺 %f", qty, remaining)
+	}
+
+	expectedPrice := totalCost / qty
+	return expectedPrice, worstPrice, nil
+}
+
 // CreateOrder 创建订单
 func (h *HyperliquidAdapter) CreateOrder(
 	side OrderSide,

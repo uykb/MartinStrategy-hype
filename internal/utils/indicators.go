@@ -40,4 +40,3 @@ func FloorToTickSize(num float64, tickSize float64) float64 {
 	}
 	return math.Floor(num/tickSize+0.00000001) * tickSize
 }
-

@@ -799,7 +799,7 @@ func (s *MartingaleStrategy) cleanCycleAndResetToIdle(cycleID uint64) {
 	}
 
 	utils.Logger.Info("开始周期清理：撤销全部挂单", zap.Uint64("cycle_id", cycleID))
-	
+
 	// 1. 同步撤销当前交易对的所有挂单（耗时约 100-500ms）
 	// 在此期间，FSM 状态仍非 IDLE，安全阻挡了 tick 触发新周期
 	if err := s.exchange.CancelAllOrders(); err != nil {
@@ -876,7 +876,6 @@ func (s *MartingaleStrategy) waitPositionZeroThenReset(cycleID uint64) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // 策略动作
 // ---------------------------------------------------------------------------
@@ -905,11 +904,11 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 		qtyNeeded := MinOrderValue / currentPrice
 		baseQty = utils.FloorToTickSize(qtyNeeded, s.stepSize)
 		baseQty = utils.FloorToDecimals(baseQty, s.quantityPrecision)
-		
+
 		if baseQty*currentPrice < MinOrderValue {
 			baseQty = utils.FloorToDecimals(baseQty+s.stepSize, s.quantityPrecision)
 		}
-		
+
 		utils.Logger.Info("基础下单金额不足，提升至交易所最低限制",
 			zap.Float64("adjusted_qty", baseQty),
 			zap.Float64("value", baseQty*currentPrice),
@@ -921,6 +920,31 @@ func (s *MartingaleStrategy) enterLong(currentPrice float64) error {
 		zap.Float64("unit_qty", unitQty),
 		zap.Float64("base_qty", baseQty),
 		zap.Float64("value", baseQty*currentPrice),
+	)
+
+	// ★ 滑点控制：检查本地订单薄深度是否满足最大允许滑点
+	expectedPrice, worstPrice, slippageErr := s.exchange.CalculateSlippage(exchange.OrderSideBuy, baseQty)
+	if slippageErr != nil {
+		utils.Logger.Error("订单薄滑点检查失败", zap.Error(slippageErr))
+		return fmt.Errorf("订单薄不足以承载基础订单: %w", slippageErr)
+	}
+
+	slippage := (expectedPrice - currentPrice) / currentPrice
+	if slippage > s.cfg.MaxSlippageRatio {
+		utils.Logger.Warn("预期滑点超出配置阈值，拒绝入场",
+			zap.Float64("expected_price", expectedPrice),
+			zap.Float64("current_price", currentPrice),
+			zap.Float64("worst_price", worstPrice),
+			zap.Float64("slippage", slippage),
+			zap.Float64("max_slippage", s.cfg.MaxSlippageRatio),
+		)
+		return fmt.Errorf("预期滑点 (%.2f%%) 超出配置阈值 (%.2f%%)", slippage*100, s.cfg.MaxSlippageRatio*100)
+	}
+
+	utils.Logger.Info("订单薄滑点检查通过",
+		zap.Float64("expected_price", expectedPrice),
+		zap.Float64("worst_price", worstPrice),
+		zap.Float64("slippage", slippage),
 	)
 
 	_, err := s.exchange.CreateOrder(exchange.OrderSideBuy, exchange.OrderTypeMarket, baseQty, currentPrice)
@@ -1461,15 +1485,15 @@ func (s *MartingaleStrategy) calcAllocatedChunk() float64 {
 	// 因此基准金额 (Allocated Chunk) 必须是 100% 的当前总余额。
 	// 忽略 config 中的 BaseRatio，防止 0.05 * 0.06 = 0.3% 的微缩错误。
 	notional := balance
-	
+
 	if notional < MinOrderValue {
 		notional = MinOrderValue
 	}
-	
+
 	utils.Logger.Info("基准仓位额度计算 (Allocated Chunk)",
 		zap.Float64("balance", balance),
 		zap.Float64("notional", notional))
-		
+
 	return notional
 }
 

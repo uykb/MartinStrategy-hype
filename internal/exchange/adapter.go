@@ -138,6 +138,10 @@ type ExchangeAdapter interface {
 	// GetBalance 获取账户可用余额（Hyperliquid 为 USDC）
 	GetBalance() (float64, error)
 
+	// GetExpectedFillPrice 计算根据本地订单薄深度吃单指定数量的预期均价
+	// 预期均价、所需最差限价、是否超出给定的滑点阈值
+	CalculateSlippage(side OrderSide, qty float64) (expectedPrice float64, worstPrice float64, err error)
+
 	// ---- 订单 ----
 
 	// CreateOrder 创建订单（市价 / 限价）

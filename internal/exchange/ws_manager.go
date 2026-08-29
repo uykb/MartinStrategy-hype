@@ -66,6 +66,12 @@ type wsLevel struct {
 	N  int     `json:"n"`
 }
 
+// LocalOrderBook 本地订单薄缓存
+type LocalOrderBook struct {
+	Bids []wsLevel
+	Asks []wsLevel
+}
+
 // wsTradeData 表示 trades 频道的数据
 type wsTradeData struct {
 	Coin string  `json:"coin"`
@@ -177,6 +183,10 @@ type WSManager struct {
 
 	// WaitGroup 用于优雅关闭
 	wg sync.WaitGroup
+
+	// 本地订单薄缓存
+	obMu      sync.RWMutex
+	orderBook LocalOrderBook
 }
 
 // NewWSManager 创建 WebSocket 管理器实例
@@ -684,6 +694,21 @@ func (w *WSManager) handleMessage(message []byte) {
 	}
 }
 
+// GetOrderBook 获取本地缓存的最新订单薄
+func (w *WSManager) GetOrderBook() LocalOrderBook {
+	w.obMu.RLock()
+	defer w.obMu.RUnlock()
+
+	// 深拷贝避免外部修改
+	ob := LocalOrderBook{
+		Bids: make([]wsLevel, len(w.orderBook.Bids)),
+		Asks: make([]wsLevel, len(w.orderBook.Asks)),
+	}
+	copy(ob.Bids, w.orderBook.Bids)
+	copy(ob.Asks, w.orderBook.Asks)
+	return ob
+}
+
 // ---------------------------------------------------------------------------
 // 频道处理器
 // ---------------------------------------------------------------------------
@@ -705,6 +730,14 @@ func (w *WSManager) handleL2Book(data json.RawMessage) {
 	// 过滤非目标交易对
 	if book.Coin != w.cfg.Symbol {
 		return
+	}
+
+	// 更新本地订单薄
+	if len(book.Levels) >= 2 {
+		w.obMu.Lock()
+		w.orderBook.Bids = book.Levels[0]
+		w.orderBook.Asks = book.Levels[1]
+		w.obMu.Unlock()
 	}
 
 	// 提取最优买价（bids[0].Px）作为最新价格

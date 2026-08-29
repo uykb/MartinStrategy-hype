@@ -40,8 +40,9 @@ type ExchangeConfig struct {
 
 // StrategyConfig 策略配置
 type StrategyConfig struct {
-	MaxSafetyOrders int     `mapstructure:"max_safety_orders"` // 最大网格层数
-	BaseRatio       float64 `mapstructure:"base_ratio"`        // 头仓比例（余额 × base_ratio）
+	MaxSafetyOrders  int     `mapstructure:"max_safety_orders"`  // 最大网格层数
+	BaseRatio        float64 `mapstructure:"base_ratio"`         // 头仓比例（余额 × base_ratio）
+	MaxSlippageRatio float64 `mapstructure:"max_slippage_ratio"` // 本地订单薄最大允许滑点比例 (如 0.005 = 0.5%)
 }
 
 // LogConfig 日志配置
@@ -65,6 +66,7 @@ func LoadConfig(path string) (*Config, error) {
 	viper.SetDefault("exchange.use_testnet", false)
 	viper.SetDefault("strategy.max_safety_orders", 9)
 	viper.SetDefault("strategy.base_ratio", 0.05)
+	viper.SetDefault("strategy.max_slippage_ratio", 0.005) // 默认 0.5% 滑点保护
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("health.addr", ":8080")
 
