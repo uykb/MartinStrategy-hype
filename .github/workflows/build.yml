@@ -50,19 +50,11 @@ jobs:
       - name: Verify static linkage
         run: file bot | grep -q "statically linked" || (echo "binary is not static" && exit 1)
 
-      - name: Package tarball
-        run: tar -czf bot-linux-amd64.tar.gz bot .env.example
-
-      - name: Generate checksum
-        run: sha256sum bot-linux-amd64.tar.gz > bot-linux-amd64.tar.gz.sha256
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bot-linux-amd64
-          path: |
-            bot-linux-amd64.tar.gz
-            bot-linux-amd64.tar.gz.sha256
+          path: bot
           if-no-files-found: error
           retention-days: 14
 
@@ -92,9 +84,7 @@ jobs:
         with:
           name: "latest"
           tag_name: "latest"
-          files: |
-            release/bot-linux-amd64.tar.gz
-            release/bot-linux-amd64.tar.gz.sha256
+          files: release/bot
           body: |
             **Version:** ${{ github.ref_name }}
 

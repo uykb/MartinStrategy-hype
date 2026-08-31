@@ -26,11 +26,11 @@ func main() {
 	// ---------------------------------------------------------------
 	// 1. 加载配置
 	// ---------------------------------------------------------------
-	// 配置文件 config.yaml 中的字段已适配 Hyperliquid：
-	//   - api_key:     Agent 钱包私钥
-	//   - api_secret:  主钱包地址
-	//   - symbol:      交易对名称（如 "HYPE"，不带 USDT 后缀）
-	cfg, err := config.LoadConfig("config.yaml")
+	// 配置完全通过环境变量（如系统 systemctl 中）获取：
+	//   - MARTIN_EXCHANGE_API_KEY:     Agent 钱包私钥
+	//   - MARTIN_EXCHANGE_API_SECRET:  主钱包地址
+	//   - MARTIN_EXCHANGE_SYMBOL:      交易对名称（如 "HYPE"，不带 USDT 后缀）
+	cfg, err := config.LoadConfig()
 	if err != nil {
 		panic(err)
 	}

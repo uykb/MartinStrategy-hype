@@ -1,5 +1,5 @@
 // Package config 提供 Viper 驱动的配置加载，
-// 支持 YAML 文件 + 环境变量覆盖（前缀 MARTIN_）。
+// 纯环境变量支持（前缀 MARTIN_），适合 systemctl 等部署方式。
 //
 // 重构说明：
 //   - ExchangeConfig 新增 Hyperliquid 专属字段
@@ -10,7 +10,6 @@ package config
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -55,13 +54,10 @@ type HealthConfig struct {
 	Addr string `mapstructure:"addr"` // 监听地址（如 ":8080"）
 }
 
-// LoadConfig 加载配置，支持 YAML 文件 + 环境变量覆盖（前缀 MARTIN_）。
-// 如果 config.yaml 不存在，则纯靠环境变量 + 默认值运行（适合 Docker 部署）。
-func LoadConfig(path string) (*Config, error) {
-	viper.SetConfigFile(path)
-	viper.SetConfigType("yaml")
-
-	// 设置默认值（Docker 部署时无需 config.yaml）
+// LoadConfig 加载配置，通过环境变量获取配置（前缀 MARTIN_）。
+// 适合 systemctl 等纯环境变量部署方式。
+func LoadConfig() (*Config, error) {
+	// 设置默认值
 	viper.SetDefault("exchange.symbol", "HYPE")
 	viper.SetDefault("exchange.use_testnet", false)
 	viper.SetDefault("strategy.max_safety_orders", 9)
@@ -77,15 +73,6 @@ func LoadConfig(path string) (*Config, error) {
 	viper.BindEnv("exchange.api_key")
 	viper.BindEnv("exchange.api_secret")
 	viper.AutomaticEnv()
-
-	// config.yaml 可选：不存在时不报错，纯靠环境变量 + 默认值
-	if err := viper.ReadInConfig(); err != nil {
-		if !os.IsNotExist(err) {
-			// 文件存在但格式错误，仍然报错
-			return nil, fmt.Errorf("读取配置文件失败: %w", err)
-		}
-		// 文件不存在：使用环境变量 + 默认值
-	}
 
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
