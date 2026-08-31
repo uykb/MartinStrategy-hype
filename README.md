@@ -79,39 +79,17 @@ MartinStrategy-Hype implements a Martingale grid strategy using an **Event-Drive
 
 ### Configuration
 
-Use environment variables (recommended for production) or `config.yaml`.
-
-**Via environment variables:**
+Configuration is managed entirely through environment variables. This is optimized for `systemctl` deployments.
 
 ```bash
 export MARTIN_EXCHANGE_API_KEY="your_agent_private_key_64_hex_no_0x"
 export MARTIN_EXCHANGE_API_SECRET="0xyour_main_wallet_address"
 export MARTIN_EXCHANGE_SYMBOL="HYPE"
-export MARTIN_EXCHANGE_USE_TESTNET="true"   # testnet first!
+export MARTIN_EXCHANGE_USE_TESTNET="false"  # set to true for testnet
 export MARTIN_LOG_LEVEL="info"
-```
-
-**Via `config.yaml`:**
-
-```yaml
-exchange:
-  api_key: ""              # Agent wallet private key (64 hex, no 0x)
-  api_secret: ""           # Main wallet address (with 0x prefix)
-  symbol: "HYPE"           # Trading pair (no USDT suffix)
-  use_testnet: false
-
-strategy:
-  max_safety_orders: 9
-  base_ratio: 0.05         # % of balance per base order
-
-storage:
-  sqlite_path: "data/bot.db"
-
-log:
-  level: "info"
-
-health:
-  addr: ":8080"
+export MARTIN_STRATEGY_MAX_SAFETY_ORDERS="9"
+export MARTIN_STRATEGY_BASE_RATIO="0.05"
+export MARTIN_HEALTH_ADDR=":8080"
 ```
 
 ### Build & Run
@@ -127,6 +105,28 @@ go build -o bot cmd/bot/main.go
 export MARTIN_EXCHANGE_API_KEY="your_agent_private_key"
 export MARTIN_EXCHANGE_API_SECRET="0xyour_main_wallet_address"
 ./bot
+```
+
+### Systemctl Deployment Example
+
+Create a file at `/etc/systemd/system/martin-bot.service`:
+
+```ini
+[Unit]
+Description=Martin Strategy Bot
+After=network.target
+
+[Service]
+Type=simple
+Environment="MARTIN_EXCHANGE_API_KEY=your_agent_private_key"
+Environment="MARTIN_EXCHANGE_API_SECRET=your_main_wallet_address"
+Environment="MARTIN_EXCHANGE_SYMBOL=HYPE"
+ExecStart=/path/to/bot
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ### Health Checks
@@ -307,7 +307,7 @@ Every long-running goroutine has `defer recover()` + 5-second self-healing resta
 .
 ├── cmd/bot/main.go                    # Entry point
 ├── internal/
-│   ├── config/config.go               # Viper config (YAML + env vars)
+│   ├── config/config.go               # Viper config (pure env vars)
 │   ├── core/event_bus.go              # Sequential event bus with self-healing
 │   ├── exchange/
 │   │   ├── adapter.go                 # ExchangeAdapter interface + domain models
@@ -321,7 +321,6 @@ Every long-running goroutine has `defer recover()` + 5-second self-healing resta
 │       ├── logger.go                  # Zap structured logging
 │       └── price_rounder.go           # 5 sig-fig price truncation
 ├── go.mod
-├── config.yaml
 └── AGENTS.md
 ```
 

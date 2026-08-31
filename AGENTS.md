@@ -9,10 +9,15 @@ go build -o bot ./cmd/bot/
 go vet ./...
 go fmt ./...
 
-# Run locally
-go run cmd/bot/main.go
+# Run locally (uses environment variables)
+MARTIN_EXCHANGE_API_KEY="..." MARTIN_EXCHANGE_API_SECRET="..." go run cmd/bot/main.go
 ```
 *Note on testing: No `_test.go` files exist yet. When adding new features, write table-driven tests alongside the source and mock exchange/storage clients.*
+
+## Configuration & Deployment
+- **Pure Environment Variables**: The project completely abandoned `config.yaml` and `.env` files. Configuration is 100% driven by environment variables with the `MARTIN_` prefix (e.g. `MARTIN_EXCHANGE_API_KEY`).
+- **Target Deployment**: The system is intended to run as a single static binary managed by `systemctl`.
+- **Release Strategy**: GitHub Actions produces only a raw binary without wrapping it in `.tar.gz` and without supplementary files like checksums or `.env.example`.
 
 ## Concurrency & Liveness Patterns
 - **TryLock Prevention**: `placeGridOrders` and `updateTP` use `gridMu.TryLock()` and `tpMu.TryLock()`. If locked, they skip execution and set dirty flags (`tpDirty`) rather than blocking the main event loop.
