@@ -1483,7 +1483,7 @@ func (s *MartingaleStrategy) calcAllocatedChunk() float64 {
 	}
 	// ★ 修复：用户希望直接使用 0.06 代表 6% 的总资金，
 	// 因此基准金额 (Allocated Chunk) 必须是 100% 的当前总余额。
-	// 忽略 config 中的 BaseRatio，防止 0.05 * 0.06 = 0.3% 的微缩错误。
+	// 网格比例已经硬编码，无需外部比例缩放。
 	notional := balance
 
 	if notional < MinOrderValue {

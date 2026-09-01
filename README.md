@@ -88,7 +88,6 @@ export MARTIN_EXCHANGE_SYMBOL="HYPE"
 export MARTIN_EXCHANGE_USE_TESTNET="false"  # set to true for testnet
 export MARTIN_LOG_LEVEL="info"
 export MARTIN_STRATEGY_MAX_SAFETY_ORDERS="9"
-export MARTIN_STRATEGY_BASE_RATIO="0.06"
 export MARTIN_HEALTH_ADDR=":8080"
 ```
 
