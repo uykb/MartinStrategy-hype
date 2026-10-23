@@ -43,7 +43,7 @@ type wsSubscription struct {
 // wsEnvelope 表示 WebSocket 推送消息的统一信封。
 // ★ P3 优化：单次反序列化覆盖 pong 响应和频道消息，消除双重 JSON 解析。
 // Hyperliquid WS 消息格式：
-//   - 心跳响应：{"method":"pong"}
+//   - 心跳响应：{"channel":"pong"}
 //   - 频道数据：{"channel":"l2Book","data":{...}}
 //   - 订阅确认：{"channel":"subscriptionResponse","data":{...}}
 type wsEnvelope struct {
@@ -667,8 +667,10 @@ func (w *WSManager) handleMessage(message []byte) {
 		return
 	}
 
-	// 快速路径：心跳 pong 响应（Method == "pong"，Channel 为空）
-	if env.Method == "pong" {
+	// 快速路径：心跳 pong 响应。
+	// Hyperliquid 服务器对 {"method":"ping"} 的实际响应是 {"channel":"pong"}
+	// （与官方 Python SDK PongMsg 类型定义一致），兼容两种格式以防 API 变更。
+	if env.Method == "pong" || env.Channel == "pong" {
 		select {
 		case w.pongCh <- struct{}{}:
 		default:
